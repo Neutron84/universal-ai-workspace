@@ -1,0 +1,59 @@
+gguf_balanced:
+  backend: llama.cpp
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+  ctx_size: 4096
+  custom_args: {}
+  description: Fast and memory-efficient for 7B-14B models on T4/L4 GPUs.
+  flash_attn: true
+  n_gpu_layers: -1
+  name: GGUF Balanced (4K FlashAttn)
+  parallel: 1
+gguf_long_ctx:
+  backend: llama.cpp
+  cache_type_k: q4_0
+  cache_type_v: q4_0
+  ctx_size: 16384
+  custom_args: {}
+  description: High context window with quantized KV cache for long document processing.
+  flash_attn: true
+  n_gpu_layers: -1
+  name: GGUF Long Context (16K FlashAttn + Q4 Cache)
+  parallel: 1
+transformers_4bit:
+  backend: transformers
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+  ctx_size: 4096
+  custom_args:
+    device_map: auto
+    load_in_4bit: true
+  description: Flexible fallback for Safetensors models on T4 GPUs.
+  flash_attn: true
+  n_gpu_layers: -1
+  name: Transformers + BitsAndBytes 4-Bit
+  parallel: 1
+vllm_high_throughput:
+  backend: vllm
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+  ctx_size: 4096
+  custom_args:
+    dtype: auto
+    gpu_memory_utilization: 0.9
+  description: PagedAttention server for unquantized / AWQ / GPTQ Safetensors.
+  flash_attn: true
+  n_gpu_layers: -1
+  name: vLLM High Throughput (L4/A100)
+  parallel: 1
+vlm_multimodal:
+  backend: llama.cpp
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+  ctx_size: 4096
+  custom_args: {}
+  description: Multimodal LLM with mmproj projector enabled.
+  flash_attn: true
+  n_gpu_layers: -1
+  name: VLM Multimodal (Vision-Language)
+  parallel: 1

@@ -62,3 +62,4 @@ runtime_state.json
 *.log
 *.tmp*
 .DS_Store
+aichat/

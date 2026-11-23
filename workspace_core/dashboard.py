@@ -325,12 +325,38 @@ class WorkspaceDashboard:
         return f"Purged temporary files. Freed {freed / (1024*1024):.2f} MB."
 
     # --- Tab 4 Callbacks ---
-    def start_server_ui(self, preset_name: str, port: int, enable_auth: bool) -> Tuple[str, str, str, str]:
+    def start_server_ui(
+        self,
+        preset_name: str,
+        port: int,
+        enable_auth: bool,
+        engine_override: str = "auto",
+        ctx_override: int = 4096,
+        gpu_layers_override: int = -1,
+        flash_attn_override: bool = True,
+        cache_k_override: str = "auto",
+        cache_v_override: str = "auto",
+    ) -> Tuple[str, str, str, str]:
         try:
+            overrides = {}
+            if engine_override and str(engine_override).lower() != "auto":
+                overrides["backend"] = engine_override
+            if ctx_override:
+                overrides["ctx_size"] = int(ctx_override)
+            if gpu_layers_override is not None:
+                overrides["n_gpu_layers"] = int(gpu_layers_override)
+            if flash_attn_override is not None:
+                overrides["flash_attn"] = bool(flash_attn_override)
+            if cache_k_override and str(cache_k_override).lower() != "auto":
+                overrides["cache_type_k"] = cache_k_override
+            if cache_v_override and str(cache_v_override).lower() != "auto":
+                overrides["cache_type_v"] = cache_v_override
+
             success = self.process_manager.start_server(
                 preset_name=preset_name,
-                port=port,
-                enable_auth=enable_auth
+                port=int(port),
+                enable_auth=enable_auth,
+                **overrides
             )
             state = self.process_manager.get_state()
             status_text = "Server Running" if state.is_server_running else "Server Failed to Start"
@@ -343,8 +369,9 @@ class WorkspaceDashboard:
         self.process_manager.stop_server()
         return "Server Stopped", "{}"
 
-    def start_tunnel_ui(self, port: int, tunnel_type: str) -> Tuple[str, str, str]:
-        pub_url = self.process_manager.start_tunnel(port=port, tunnel_type=tunnel_type)
+    def start_tunnel_ui(self, port: int, tunnel_type: str, tunnel_token: str = "") -> Tuple[str, str, str]:
+        token_val = tunnel_token.strip() if tunnel_token and tunnel_token.strip() else None
+        pub_url = self.process_manager.start_tunnel(port=int(port), tunnel_type=tunnel_type, tunnel_token=token_val)
         state = self.process_manager.get_state()
         status_text = f"Tunnel Active: {pub_url}" if pub_url else "Tunnel Inactive"
         py_snippet, curl_snippet = self.generate_code_snippets(state)
@@ -669,6 +696,25 @@ print()
                         port_input = gr.Number(label="Server Port", value=8000, precision=0)
                         auth_checkbox = gr.Checkbox(label="Enable API Key Auth", value=True)
 
+                    with gr.Accordion("Manual Hardware & Engine Overrides", open=False):
+                        with gr.Row():
+                            srv_engine_override = gr.Dropdown(
+                                label="Engine Override",
+                                choices=["auto", "llama.cpp", "ik_llama", "vllm", "transformers", "unsloth", "exllamav2", "diffusers", "faster-whisper"],
+                                value="auto",
+                                scale=1
+                            )
+                            srv_ctx_override = gr.Slider(
+                                minimum=512, maximum=65536, step=512, value=4096, label="Context Size (n_ctx)", scale=1
+                            )
+                            srv_layers_override = gr.Number(
+                                label="GPU Layers (-1 = all, 0 = CPU)", value=-1, precision=0, scale=1
+                            )
+                        with gr.Row():
+                            srv_fa_override = gr.Checkbox(label="Flash Attention", value=True)
+                            srv_cache_k = gr.Dropdown(label="KV Cache K Quant", choices=["auto", "q8_0", "q4_0", "f16"], value="auto")
+                            srv_cache_v = gr.Dropdown(label="KV Cache V Quant", choices=["auto", "q8_0", "q4_0", "f16"], value="auto")
+
                     with gr.Row():
                         start_srv_btn = gr.Button("Start Server", variant="primary")
                         stop_srv_btn = gr.Button("Stop Server", variant="stop")
@@ -676,11 +722,12 @@ print()
                     server_status_md = gr.Markdown("Server Stopped")
                     endpoints_json = gr.Code(label="Local API Endpoints", language="json", value="{}")
 
-                    gr.Markdown("### Public Tunneling (Cloudflare)")
+                    gr.Markdown("### Public Tunneling (Cloudflare & Ngrok)")
                     with gr.Row():
-                        tunnel_dropdown = gr.Dropdown(label="Tunnel Provider", choices=["cloudflared", "ngrok"], value="cloudflared")
-                        start_tun_btn = gr.Button("Start Public Tunnel", variant="primary")
-                        stop_tun_btn = gr.Button("Stop Tunnel", variant="stop")
+                        tunnel_dropdown = gr.Dropdown(label="Tunnel Provider", choices=["cloudflared", "ngrok"], value="cloudflared", scale=1)
+                        tunnel_token_input = gr.Textbox(label="Tunnel Token (Optional: Named Cloudflare / Ngrok)", type="password", placeholder="Enter persistent tunnel token if available", scale=2)
+                        start_tun_btn = gr.Button("Start Public Tunnel", variant="primary", scale=1)
+                        stop_tun_btn = gr.Button("Stop Tunnel", variant="stop", scale=1)
 
                     tunnel_status_md = gr.Markdown("Tunnel Stopped")
 
@@ -701,13 +748,13 @@ print()
 
                     start_srv_btn.click(
                         fn=self.start_server_ui,
-                        inputs=[preset_dropdown, port_input, auth_checkbox],
+                        inputs=[preset_dropdown, port_input, auth_checkbox, srv_engine_override, srv_ctx_override, srv_layers_override, srv_fa_override, srv_cache_k, srv_cache_v],
                         outputs=[server_status_md, endpoints_json, py_code, curl_code]
                     )
                     stop_srv_btn.click(fn=self.stop_server_ui, outputs=[server_status_md, endpoints_json])
                     start_tun_btn.click(
                         fn=self.start_tunnel_ui,
-                        inputs=[port_input, tunnel_dropdown],
+                        inputs=[port_input, tunnel_dropdown, tunnel_token_input],
                         outputs=[tunnel_status_md, py_code, curl_code]
                     )
                     stop_tun_btn.click(fn=self.stop_tunnel_ui, outputs=[tunnel_status_md, py_code, curl_code])

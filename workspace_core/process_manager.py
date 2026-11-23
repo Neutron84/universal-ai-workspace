@@ -246,8 +246,8 @@ class ProcessManager:
         if preset_name:
             preset = self.config.presets.get(preset_name)
 
-        # Merge recommendation overrides if provided
-        overrides = dict(preset_overrides)
+        # Base overrides from recommendation
+        overrides: Dict[str, Any] = {}
         if recommendation:
             if recommendation.recommended_ctx:
                 overrides["ctx_size"] = recommendation.recommended_ctx
@@ -259,6 +259,11 @@ class ProcessManager:
                 overrides["cache_type_k"] = recommendation.cache_type_k
             if recommendation.cache_type_v:
                 overrides["cache_type_v"] = recommendation.cache_type_v
+
+        # Explicit caller / user overrides take top precedence!
+        for k, v in preset_overrides.items():
+            if v is not None:
+                overrides[k] = v
 
         # Select engine backend
         backend = overrides.pop("backend", None)
@@ -332,7 +337,12 @@ class ProcessManager:
         self._save_state()
         return True
 
-    def start_tunnel(self, port: int = 8000, tunnel_type: str = "cloudflared") -> Optional[str]:
+    def start_tunnel(
+        self,
+        port: int = 8000,
+        tunnel_type: str = "cloudflared",
+        tunnel_token: Optional[str] = None
+    ) -> Optional[str]:
         """
         Starts public tunnel without subprocess pipe deadlocks.
         Redirects output directly to cloudflared.log and extracts public URL.
@@ -348,7 +358,7 @@ class ProcessManager:
                 cf_bin = em.fetch_cloudflared()
 
             # Check for persistent Named Tunnel token
-            named_token = SecurityManager.get_cf_tunnel_token()
+            named_token = tunnel_token or SecurityManager.get_cf_tunnel_token()
             if named_token:
                 cmd = [cf_bin, "tunnel", "run", "--token", named_token]
             else:
@@ -418,7 +428,7 @@ class ProcessManager:
                 return None
 
         elif tunnel_type == "ngrok":
-            ngrok_token = SecurityManager.get_ngrok_token()
+            ngrok_token = tunnel_token or SecurityManager.get_ngrok_token()
             if not ngrok_token:
                 print("[ProcessManager] Ngrok token not found in secrets/env.")
                 return None

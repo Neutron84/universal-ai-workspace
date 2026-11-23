@@ -10,12 +10,18 @@ from typing import Any, Dict, Optional, Union
 import yaml
 from pydantic import BaseModel, Field
 
-from .io_resolver import IOResolver, ResolvedWorkspacePaths, WorkspaceMode
+from .io_resolver import (
+    IOResolver,
+    ResolvedWorkspacePaths,
+    WorkspaceMode,
+    get_default_local_root,
+    get_default_runtime_root,
+)
 
 
 DEFAULT_DRIVE_ROOT = "/content/drive/MyDrive/AI_Workspace"
-FALLBACK_LOCAL_ROOT = "/content/ai_workspace"
-DEFAULT_RUNTIME_ROOT = "/content/runtime"
+FALLBACK_LOCAL_ROOT = str(get_default_local_root())
+DEFAULT_RUNTIME_ROOT = str(get_default_runtime_root())
 
 
 class ServerPreset(BaseModel):
@@ -155,20 +161,41 @@ class WorkspaceConfig:
             except Exception as e:
                 print(f"[WorkspaceConfig] Warning: Failed to parse settings.yaml ({e}), using defaults.")
 
-        default_settings = WorkspaceSettings(
-            workspace_mode=self.mode.value if hasattr(self.mode, "value") else str(self.mode),
-            drive_root=str(self.drive_root),
-            runtime_root=str(self.runtime_root)
-        )
+        # Check for packaged template configs
+        repo_settings = Path(__file__).parent.parent / "configs" / "settings.yaml"
+        if repo_settings.exists() and repo_settings.resolve() != self.settings_file.resolve():
+            try:
+                with open(repo_settings, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f) or {}
+                data["workspace_mode"] = self.mode.value if hasattr(self.mode, "value") else str(self.mode)
+                data["drive_root"] = str(self.drive_root)
+                data["runtime_root"] = str(self.runtime_root)
+                default_settings = WorkspaceSettings(**data)
+            except Exception:
+                default_settings = WorkspaceSettings(
+                    workspace_mode=self.mode.value if hasattr(self.mode, "value") else str(self.mode),
+                    drive_root=str(self.drive_root),
+                    runtime_root=str(self.runtime_root)
+                )
+        else:
+            default_settings = WorkspaceSettings(
+                workspace_mode=self.mode.value if hasattr(self.mode, "value") else str(self.mode),
+                drive_root=str(self.drive_root),
+                runtime_root=str(self.runtime_root)
+            )
         self.save_settings(default_settings)
         return default_settings
 
     def save_settings(self, settings: Optional[WorkspaceSettings] = None) -> None:
-        """Save settings to settings.yaml."""
+        """Save settings to settings.yaml safely."""
         if settings is not None:
             self.settings = settings
-        with open(self.settings_file, "w", encoding="utf-8") as f:
-            yaml.dump(self.settings.model_dump(), f, default_flow_style=False)
+        try:
+            self.settings_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.settings_file, "w", encoding="utf-8") as f:
+                yaml.dump(self.settings.model_dump(), f, default_flow_style=False)
+        except (PermissionError, OSError):
+            pass
 
     def load_presets(self) -> Dict[str, ServerPreset]:
         """Load server presets from presets.yaml or create defaults."""
@@ -182,6 +209,20 @@ class WorkspaceConfig:
                 return presets
             except Exception as e:
                 print(f"[WorkspaceConfig] Warning: Failed to parse presets.yaml ({e}), creating defaults.")
+
+        # Check for packaged template presets
+        repo_presets = Path(__file__).parent.parent / "configs" / "presets.yaml"
+        if repo_presets.exists() and repo_presets.resolve() != self.presets_file.resolve():
+            try:
+                with open(repo_presets, "r", encoding="utf-8") as f:
+                    raw_data = yaml.safe_load(f) or {}
+                presets = {}
+                for key, val in raw_data.items():
+                    presets[key] = ServerPreset(**val)
+                self.save_presets(presets)
+                return presets
+            except Exception:
+                pass
 
         defaults = {
             "gguf_balanced": ServerPreset(
@@ -253,11 +294,15 @@ class WorkspaceConfig:
         return defaults
 
     def save_presets(self, presets: Dict[str, ServerPreset]) -> None:
-        """Save server presets to presets.yaml."""
+        """Save server presets to presets.yaml safely."""
         self.presets = presets
         serializable = {k: v.model_dump() for k, v in presets.items()}
-        with open(self.presets_file, "w", encoding="utf-8") as f:
-            yaml.dump(serializable, f, default_flow_style=False)
+        try:
+            self.presets_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.presets_file, "w", encoding="utf-8") as f:
+                yaml.dump(serializable, f, default_flow_style=False)
+        except (PermissionError, OSError):
+            pass
 
 
 _CONFIG_INSTANCE: Optional[WorkspaceConfig] = None

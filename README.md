@@ -90,16 +90,22 @@ Universal AI Workspace provides a modular environment for running, converting, a
 - `unpack_archive`: Automatically extracts `.zip`, `.tar.gz`, `.tar.xz`, and `.tar.bz2` input archives.
 - `task`: Operation mode (`serve` to host an API server, `convert_and_quantize` to run conversion, or `dashboard_only`).
 - `engine`: Inference engine (`auto`, `llama.cpp`, `ik_llama`, `vllm`, `transformers`, `unsloth`, `exllamav2`, `diffusers`, `faster-whisper`).
-- `quantizer`: Quantization backend (`auto`, `llama.cpp`, `ik_llama`, `unsloth`, `gptqmodel`, `autoawq`, `exllamav2`, `ct2`).
+- `quantizer`: Quantization backend (`auto`, `none`, `llama.cpp`, `ik_llama`, `unsloth`, `gptqmodel`, `autoawq`, `exllamav2`, `ct2`).
 - `target_quant`: Desired quantization format (`auto`, `Q4_K_M`, `IQ4_KS`, `Q8_0`, `AWQ`, `GPTQ`, `EXL2`, etc.).
 - `context_size`: Context window size in tokens. Default: `4096`.
+- `n_gpu_layers`: Number of layers to offload to GPU (-1 for all GPU layers, 0 for CPU only, or positive integer for partial offload).
+- `flash_attn`: Enables Flash Attention on supported GPUs (`sm_75+`) for speed and VRAM savings.
+- `cache_type_k` / `cache_type_v`: KV cache quantization format (`auto`, `q8_0`, `q4_0`, `f16`).
+- `custom_server_args`: Optional raw CLI flags passed directly to the inference server.
 - `use_imatrix`: Enables importance matrix calibration during `llama.cpp` quantization.
 - `output_type`: Destination for artifacts (`none`, `local_ssd`, `direct_download`, `google_drive`, `gdrive_relative`, `gdrive_direct`, `huggingface_hub`, `custom_path`).
 - `output_path`: Destination path or Hugging Face repository ID (`username/repo-name`).
 - `output_name`: Custom filename or folder name. Derived automatically if left blank.
 - `zip_output`: Compresses exported artifacts into a `.zip` archive before saving or downloading.
 - `cleanup_source`: Deletes oversized source files after successful conversion to reclaim local disk space.
-- `enable_tunnel`: Launches a Cloudflare tunnel for public API access.
+- `enable_tunnel`: Launches a public tunnel endpoint.
+- `tunnel_type`: Public tunnel service (`cloudflared`, `ngrok`, `none`).
+- `tunnel_token`: Optional persistent Cloudflare Named Tunnel token or Ngrok authtoken.
 - `enable_api_auth`: Generates and enforces an API key for server access.
 - `port`: Local port for the inference server. Default: `8000`.
 - `hf_token`: Hugging Face access token for gated models and repository uploads.

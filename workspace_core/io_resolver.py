@@ -62,6 +62,28 @@ class OutputMode(str, Enum):
     HUGGINGFACE_UPLOAD = "huggingface_hub"
 
 
+def get_default_local_root() -> Path:
+    """Returns a valid, writable local workspace root for Colab or local environments."""
+    if os.environ.get("WORKSPACE_ROOT"):
+        return Path(os.environ["WORKSPACE_ROOT"]).resolve()
+    content_dir = Path("/content")
+    if content_dir.is_dir() and os.access(str(content_dir), os.W_OK):
+        return Path("/content/ai_workspace")
+    if (Path.cwd() / "configs" / "settings.yaml").exists():
+        return Path.cwd().resolve()
+    return (Path.cwd() / "ai_workspace").resolve()
+
+
+def get_default_runtime_root() -> Path:
+    """Returns a valid, writable runtime root for Colab or local environments."""
+    if os.environ.get("RUNTIME_ROOT"):
+        return Path(os.environ["RUNTIME_ROOT"]).resolve()
+    content_dir = Path("/content")
+    if content_dir.is_dir() and os.access(str(content_dir), os.W_OK):
+        return Path("/content/runtime")
+    return (Path.cwd() / "runtime").resolve()
+
+
 @dataclass
 class ResolvedWorkspacePaths:
     mode: WorkspaceMode
@@ -147,11 +169,11 @@ class IOResolver:
         else:
             w_mode = mode
 
-        rt_root = Path(runtime_root or "/content/runtime").resolve()
+        rt_root = Path(runtime_root or get_default_runtime_root()).resolve()
         drive_mounted = False
 
         if w_mode == WorkspaceMode.LOCAL_SSD:
-            ws_root = Path(workspace_path or "/content/ai_workspace").resolve()
+            ws_root = Path(workspace_path or get_default_local_root()).resolve()
             drive_mounted = False
 
         elif w_mode == WorkspaceMode.HYBRID:
@@ -166,7 +188,7 @@ class IOResolver:
             else:
                 print("[IOResolver] Google Drive unavailable for Hybrid mode. Operating in Local SSD mode.")
                 w_mode = WorkspaceMode.LOCAL_SSD
-                ws_root = Path(workspace_path or "/content/ai_workspace").resolve()
+                ws_root = Path(workspace_path or get_default_local_root()).resolve()
 
         elif w_mode == WorkspaceMode.GOOGLE_DRIVE:
             drive_mounted = cls.ensure_google_drive_mounted()
@@ -186,7 +208,7 @@ class IOResolver:
             drive_mounted = Path("/content/drive/MyDrive").is_dir()
 
         else:
-            ws_root = Path(workspace_path or "/content/ai_workspace").resolve()
+            ws_root = Path(workspace_path or get_default_local_root()).resolve()
 
         configs_dir = ws_root / "configs"
         cache_dir = ws_root / "cache"

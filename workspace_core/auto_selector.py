@@ -55,10 +55,16 @@ class AutoSelector:
         override_quantizer: Optional[str] = None,
         task: str = "serve",
         cuda_overhead_mb: float = 1200.0,
+        override_n_gpu_layers: Optional[int] = None,
+        override_flash_attn: Optional[bool] = None,
+        override_cache_type_k: Optional[str] = None,
+        override_cache_type_v: Optional[str] = None,
+        custom_args: Optional[Dict[str, Any]] = None,
     ) -> SelectionRecommendation:
         """
         Analyzes model architecture, precision, and VRAM budget to recommend
         the optimal inference engine, quantizer, and server parameters.
+        Strictly respects explicit user overrides when specified.
         """
         primary_gpu = self.hw.primary_gpu
         has_gpu = self.hw.has_gpu and primary_gpu is not None
@@ -77,6 +83,14 @@ class AutoSelector:
         user_engine = override_engine if (override_engine and override_engine.lower() != "auto") else None
         user_quantizer = override_quantizer if (override_quantizer and override_quantizer.lower() != "auto") else None
         user_quant = override_quant if (override_quant and override_quant.lower() != "auto") else None
+        user_n_gpu_layers = override_n_gpu_layers
+        user_flash_attn = override_flash_attn
+        if override_cache_type_k and override_cache_type_k.lower() != "auto":
+            cache_type_k = override_cache_type_k
+        if override_cache_type_v and override_cache_type_v.lower() != "auto":
+            cache_type_v = override_cache_type_v
+        if user_flash_attn is not None:
+            supports_fa = user_flash_attn
 
         if not has_gpu:
             return self._recommend_cpu_fallback(
@@ -84,7 +98,11 @@ class AutoSelector:
                 requested_ctx=requested_ctx,
                 user_engine=user_engine,
                 user_quantizer=user_quantizer,
-                user_quant=user_quant
+                user_quant=user_quant,
+                user_n_gpu_layers=user_n_gpu_layers,
+                user_flash_attn=user_flash_attn,
+                cache_type_k=cache_type_k,
+                cache_type_v=cache_type_v
             )
 
         free_vram_mb = primary_gpu.free_vram_mb
@@ -194,6 +212,7 @@ class AutoSelector:
                 f"Usable VRAM: {vram_budget_mb:.0f} MB | Engine: {recommended_engine} | "
                 f"Converter: {recommended_converter or 'none'} | Reason: {reasoning}"
             )
+            n_layers = user_n_gpu_layers if user_n_gpu_layers is not None else -1
             return SelectionRecommendation(
                 source_model_id=inspection.model_id,
                 selected_variant=None,
@@ -202,7 +221,7 @@ class AutoSelector:
                 recommended_converter=recommended_converter,
                 vram_budget_mb=vram_budget_mb,
                 recommended_ctx=requested_ctx,
-                recommended_n_gpu_layers=-1,
+                recommended_n_gpu_layers=n_layers,
                 flash_attn=supports_fa,
                 cache_type_k=cache_type_k,
                 cache_type_v=cache_type_v,
@@ -218,7 +237,10 @@ class AutoSelector:
                 v = matched[0]
                 model_mb = v.total_size_bytes / (1024 * 1024)
                 fits = model_mb <= vram_budget_mb
-                n_layers = -1 if fits else self._calculate_partial_layers(model_mb, vram_budget_mb)
+                if user_n_gpu_layers is not None:
+                    n_layers = user_n_gpu_layers
+                else:
+                    n_layers = -1 if fits else self._calculate_partial_layers(model_mb, vram_budget_mb)
                 summary = (
                     f"Architecture: {inspection.architecture_name or 'GGUF'} | Quant: {v.quant} (Override) | "
                     f"Usable VRAM: {vram_budget_mb:.0f} MB (Model: {model_mb:.0f} MB) | "
@@ -242,12 +264,43 @@ class AutoSelector:
                     reasoning=f"User override '{user_quant}' selected.",
                     decision_summary=summary,
                 )
+            else:
+                # User requested a specific quant variant not present in repo -> trigger re-quantization!
+                smallest_existing = min(variants, key=lambda v: v.total_size_bytes)
+                n_layers = user_n_gpu_layers if user_n_gpu_layers is not None else -1
+                summary = (
+                    f"Architecture: {inspection.architecture_name or 'GGUF'} | Re-quant Target: {user_quant} (Override) | "
+                    f"Usable VRAM: {vram_budget_mb:.0f} MB | Engine: {recommended_engine} | "
+                    f"Converter: {recommended_converter} | "
+                    f"Reason: User override '{user_quant}' not found in repo. Scheduled re-quantization from {smallest_existing.quant}."
+                )
+                return SelectionRecommendation(
+                    source_model_id=inspection.model_id,
+                    selected_variant=smallest_existing,
+                    recommended_quant=user_quant,
+                    recommended_engine=recommended_engine,
+                    recommended_converter=recommended_converter,
+                    needs_requant=True,
+                    requant_target_quant=user_quant,
+                    requant_source_file=smallest_existing.shard_files[0],
+                    vram_budget_mb=vram_budget_mb,
+                    estimated_model_vram_mb=smallest_existing.total_size_bytes / (1024 * 1024),
+                    recommended_ctx=requested_ctx,
+                    recommended_n_gpu_layers=n_layers,
+                    flash_attn=supports_fa,
+                    cache_type_k=cache_type_k,
+                    cache_type_v=cache_type_v,
+                    mmproj_file=smallest_existing.mmproj_file,
+                    reasoning=f"User requested quant '{user_quant}' not present in repo. Re-quantization scheduled.",
+                    decision_summary=summary,
+                )
 
         # Find highest quality variant fitting in VRAM
         fitting_variants = [v for v in variants if (v.total_size_bytes / (1024 * 1024)) <= vram_budget_mb]
         if fitting_variants:
             best = fitting_variants[0]
             model_mb = best.total_size_bytes / (1024 * 1024)
+            n_layers = user_n_gpu_layers if user_n_gpu_layers is not None else -1
             summary = (
                 f"Architecture: {inspection.architecture_name or 'GGUF'} | Quant: {best.quant} | "
                 f"Usable VRAM: {vram_budget_mb:.0f} MB (Model: {model_mb:.0f} MB) | "
@@ -263,7 +316,7 @@ class AutoSelector:
                 vram_budget_mb=vram_budget_mb,
                 estimated_model_vram_mb=model_mb,
                 recommended_ctx=requested_ctx,
-                recommended_n_gpu_layers=-1,
+                recommended_n_gpu_layers=n_layers,
                 flash_attn=supports_fa,
                 cache_type_k=cache_type_k,
                 cache_type_v=cache_type_v,
@@ -282,6 +335,7 @@ class AutoSelector:
         )
 
         if requant_target:
+            n_layers = user_n_gpu_layers if user_n_gpu_layers is not None else -1
             summary = (
                 f"Architecture: {inspection.architecture_name or 'GGUF'} | Re-quant Target: {requant_target} | "
                 f"Usable VRAM: {vram_budget_mb:.0f} MB | Engine: {recommended_engine} | "
@@ -300,7 +354,7 @@ class AutoSelector:
                 vram_budget_mb=vram_budget_mb,
                 estimated_model_vram_mb=smallest_mb,
                 recommended_ctx=requested_ctx,
-                recommended_n_gpu_layers=-1,
+                recommended_n_gpu_layers=n_layers,
                 flash_attn=supports_fa,
                 cache_type_k=cache_type_k,
                 cache_type_v=cache_type_v,
@@ -310,7 +364,7 @@ class AutoSelector:
             )
 
         # Fallback: Partial layer offload
-        partial_layers = self._calculate_partial_layers(smallest_mb, vram_budget_mb)
+        partial_layers = user_n_gpu_layers if user_n_gpu_layers is not None else self._calculate_partial_layers(smallest_mb, vram_budget_mb)
         safe_ctx = 2048 if requested_ctx > 2048 else requested_ctx
         summary = (
             f"Architecture: {inspection.architecture_name or 'GGUF'} | Quant: {smallest_existing.quant} | "
@@ -329,8 +383,8 @@ class AutoSelector:
             recommended_ctx=safe_ctx,
             recommended_n_gpu_layers=partial_layers,
             flash_attn=supports_fa,
-            cache_type_k="q4_0",
-            cache_type_v="q4_0",
+            cache_type_k=cache_type_k,
+            cache_type_v=cache_type_v,
             mmproj_file=smallest_existing.mmproj_file,
             reasoning=f"Model exceeds VRAM. Partial offload ({partial_layers} GPU layers) and safe context ({safe_ctx}) applied.",
             decision_summary=summary,
@@ -343,6 +397,10 @@ class AutoSelector:
         user_engine: Optional[str] = None,
         user_quantizer: Optional[str] = None,
         user_quant: Optional[str] = None,
+        user_n_gpu_layers: Optional[int] = None,
+        user_flash_attn: Optional[bool] = None,
+        cache_type_k: str = "f16",
+        cache_type_v: str = "f16",
     ) -> SelectionRecommendation:
         """Generates CPU-only recommendation."""
         variants = inspection.gguf_variants
@@ -358,6 +416,8 @@ class AutoSelector:
         quant = user_quant or (selected.quant if selected else "Q4_0")
         engine = user_engine or ("faster-whisper" if inspection.model_type == "audio" else "llama.cpp")
         converter = user_quantizer or ("ct2" if inspection.model_type == "audio" else "llama.cpp")
+        n_layers = user_n_gpu_layers if user_n_gpu_layers is not None else 0
+        fa = user_flash_attn if user_flash_attn is not None else False
         summary = (
             f"Architecture: {inspection.architecture_name or inspection.model_type} | Quant: {quant} | "
             f"Hardware: CPU Mode | Engine: {engine} | Converter: {converter} | Reason: No GPU detected."
@@ -371,10 +431,10 @@ class AutoSelector:
             recommended_converter=converter,
             vram_budget_mb=0.0,
             recommended_ctx=min(requested_ctx, 2048),
-            recommended_n_gpu_layers=0,
-            flash_attn=False,
-            cache_type_k="f16",
-            cache_type_v="f16",
+            recommended_n_gpu_layers=n_layers,
+            flash_attn=fa,
+            cache_type_k=cache_type_k,
+            cache_type_v=cache_type_v,
             is_cpu_fallback=True,
             reasoning="No GPU detected. Running in CPU fallback mode (0 GPU layers).",
             decision_summary=summary,

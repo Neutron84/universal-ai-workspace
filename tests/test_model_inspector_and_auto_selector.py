@@ -217,6 +217,77 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
         self.assertEqual(rec.recommended_engine, "faster-whisper")
         self.assertEqual(rec.recommended_converter, "ct2")
 
+    def test_manual_overrides_strictly_respected(self):
+        """User manual overrides must be strictly honored by AutoSelector."""
+        insp = InspectionResult(
+            source_type="hf_repo",
+            raw_source="Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+            model_id="Qwen2.5-0.5B-Instruct-GGUF",
+            model_type="llm-gguf",
+            quant_format="gguf_standard",
+            gguf_variants=[
+                GGUFVariant(
+                    name="qwen2.5-0.5b-instruct-q4_k_m.gguf",
+                    quant="Q4_K_M",
+                    is_split=False,
+                    shard_files=["qwen2.5-0.5b-instruct-q4_k_m.gguf"],
+                    total_size_bytes=350 * 1024 * 1024,
+                    total_size_gb=0.35,
+                    is_ik_quant=False
+                )
+            ]
+        )
+        selector = AutoSelector(hardware=self.t4_hw)
+        rec = selector.recommend(
+            inspection=insp,
+            requested_ctx=8192,
+            override_engine="ik_llama",
+            override_quantizer="ik_llama",
+            override_quant="Q4_K_M",
+            override_n_gpu_layers=20,
+            override_flash_attn=False,
+            override_cache_type_k="q4_0",
+            override_cache_type_v="q4_0"
+        )
+
+        self.assertEqual(rec.recommended_engine, "ik_llama")
+        self.assertEqual(rec.recommended_converter, "ik_llama")
+        self.assertEqual(rec.recommended_quant, "Q4_K_M")
+        self.assertEqual(rec.recommended_ctx, 8192)
+        self.assertEqual(rec.recommended_n_gpu_layers, 20)
+        self.assertFalse(rec.flash_attn)
+        self.assertEqual(rec.cache_type_k, "q4_0")
+        self.assertEqual(rec.cache_type_v, "q4_0")
+
+    def test_manual_quant_not_in_repo_triggers_requant(self):
+        """When user manually overrides target_quant to a format not in repo, trigger re-quantization."""
+        insp = InspectionResult(
+            source_type="hf_repo",
+            raw_source="test/repo-gguf",
+            model_id="repo-gguf",
+            model_type="llm-gguf",
+            quant_format="gguf_standard",
+            gguf_variants=[
+                GGUFVariant(
+                    name="model-q8_0.gguf",
+                    quant="Q8_0",
+                    is_split=False,
+                    shard_files=["model-q8_0.gguf"],
+                    total_size_bytes=8 * 1024 * 1024 * 1024,
+                    total_size_gb=8.0,
+                    is_ik_quant=False
+                )
+            ]
+        )
+        selector = AutoSelector(hardware=self.t4_hw)
+        rec = selector.recommend(
+            inspection=insp,
+            override_quant="Q4_K_M"
+        )
+        self.assertTrue(rec.needs_requant)
+        self.assertEqual(rec.requant_target_quant, "Q4_K_M")
+        self.assertEqual(rec.recommended_quant, "Q4_K_M")
+
 
 if __name__ == "__main__":
     unittest.main()

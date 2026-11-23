@@ -2,30 +2,35 @@
 Universal Model Inspector
 Inspects HuggingFace Hub repositories, direct URLs, CivitAI models, and local files.
 Auto-classifies model architectures (LLM, VLM, Embeddings, Safetensors, Diffusion, Audio).
-Handles split/sharded GGUF detection and VLM mmproj pairing with exact byte sizes.
+Handles split/sharded GGUF detection, non-uniform ik_llama quants, MoE, and LoRA adapters.
 """
 
-import os
-import re
 from dataclasses import dataclass, field
+import json
+import os
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, hf_hub_download
 from .security import SecurityManager
 from .io_resolver import IOResolver, InputMode, ResolvedInput
 
 
-# Known GGUF quantization patterns
+# Known GGUF quantization patterns (including ik_llama non-uniform quants)
 QUANT_ORDER = [
     "Q8_0",
     "Q6_K",
+    "IQ6_K",
     "Q5_K_M",
+    "IQ5_K",
     "Q5_K_S",
     "Q5_0",
     "Q5_1",
     "Q4_K_M",
+    "IQ4_K",
+    "IQ4_KS",
     "Q4_K_S",
     "Q4_0",
     "Q4_1",
@@ -33,14 +38,24 @@ QUANT_ORDER = [
     "IQ4_NL",
     "Q3_K_L",
     "Q3_K_M",
+    "IQ3_K",
+    "IQ3_KS",
     "Q3_K_S",
     "IQ3_M",
     "IQ3_S",
     "Q2_K",
+    "IQ2_K",
+    "IQ2_KS",
     "IQ2_M",
     "IQ2_S",
     "IQ1_S",
+    "IQ1_M",
 ]
+
+IK_QUANT_TAGS = {
+    "IQ4_K", "IQ4_KS", "IQ3_K", "IQ3_KS", "IQ2_K", "IQ2_KS",
+    "IQ5_K", "IQ6_K", "_R4", "_R16"
+}
 
 # Quantization relative size factor relative to F16 (used for re-quantization size estimates)
 QUANT_SIZE_FACTORS = {
@@ -49,11 +64,15 @@ QUANT_SIZE_FACTORS = {
     "BF16": 1.0,
     "Q8_0": 0.54,
     "Q6_K": 0.43,
+    "IQ6_K": 0.43,
     "Q5_K_M": 0.38,
+    "IQ5_K": 0.38,
     "Q5_K_S": 0.36,
     "Q5_0": 0.37,
     "Q5_1": 0.40,
     "Q4_K_M": 0.31,
+    "IQ4_K": 0.31,
+    "IQ4_KS": 0.30,
     "Q4_K_S": 0.30,
     "Q4_0": 0.29,
     "Q4_1": 0.33,
@@ -61,10 +80,14 @@ QUANT_SIZE_FACTORS = {
     "IQ4_NL": 0.28,
     "Q3_K_L": 0.27,
     "Q3_K_M": 0.25,
+    "IQ3_K": 0.25,
+    "IQ3_KS": 0.24,
     "Q3_K_S": 0.24,
     "IQ3_M": 0.24,
     "IQ3_S": 0.23,
     "Q2_K": 0.18,
+    "IQ2_K": 0.18,
+    "IQ2_KS": 0.17,
     "IQ2_M": 0.17,
     "IQ2_S": 0.16,
     "IQ1_M": 0.12,
@@ -81,6 +104,7 @@ class GGUFVariant:
     total_size_bytes: int
     total_size_gb: float
     is_oversized: bool = False
+    is_ik_quant: bool = False
     mmproj_file: Optional[str] = None
 
 
@@ -100,6 +124,12 @@ class InspectionResult:
     primary_download_files: List[str] = field(default_factory=list)
     config_json: Optional[Dict[str, Any]] = None
     suggested_backend: str = "llama.cpp"
+    is_moe: bool = False
+    is_lora: bool = False
+    is_vlm: bool = False
+    is_ik_quant: bool = False
+    quant_format: str = "unknown"
+    architecture_name: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -125,7 +155,7 @@ class ModelInspector:
         resolved_input = IOResolver.resolve_input(source, mode=input_mode or InputMode.AUTO)
 
         # 1. Local path check (direct, google_drive, gdrive_relative)
-        if resolved_input.mode in (InputMode.DIRECT, InputMode.GOOGLE_DRIVE, InputMode.GDRIVE_RELATIVE):
+        if resolved_input.mode in (InputMode.LOCAL_PATH, InputMode.DIRECT, InputMode.GOOGLE_DRIVE, InputMode.GDRIVE_RELATIVE):
             if resolved_input.local_path and resolved_input.local_path.exists():
                 return self._inspect_local(resolved_input.local_path)
             elif Path(source).exists():
@@ -197,9 +227,6 @@ class ModelInspector:
 
     def _parse_hf_url(self, url: str) -> Optional[Tuple[str, Optional[str]]]:
         """Extracts (repo_id, subpath/filename) from Hugging Face URLs."""
-        # e.g. https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF
-        # e.g. https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/model.gguf
-        # e.g. https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/blob/main/model.gguf
         pattern = r"huggingface\.co/([^/]+/[^/]+)(?:/(?:resolve|blob)/[^/]+/(.+))?"
         match = re.search(pattern, url)
         if match:
@@ -208,8 +235,104 @@ class ModelInspector:
             return repo_id, file_path
         return None
 
+    def _extract_architecture_and_quant_flags(
+        self,
+        config_data: Dict[str, Any],
+        file_names: List[str],
+        repo_id: str = "",
+        tags: Optional[List[str]] = None,
+        variants: Optional[List[GGUFVariant]] = None,
+    ) -> Dict[str, Any]:
+        """Inspects config.json data, file listings, and tags to detect MoE, LoRA, VLM, and Quantization format."""
+        tags = tags or []
+        lower_tags = [t.lower() for t in tags]
+        lower_repo = repo_id.lower()
+        lower_files = [f.lower() for f in file_names]
+
+        # 1. MoE Architecture Check
+        is_moe = False
+        num_local_experts = config_data.get("num_local_experts") or config_data.get("n_routed_experts") or config_data.get("num_experts") or config_data.get("moe_num_experts") or 0
+        if int(num_local_experts) > 1:
+            is_moe = True
+
+        architectures = config_data.get("architectures", [])
+        architecture_name = architectures[0] if architectures else None
+        if architecture_name:
+            arch_lower = architecture_name.lower()
+            if any(k in arch_lower for k in ("moe", "mixtral", "deepseek", "qwen2moe", "dbrx", "jamba")):
+                is_moe = True
+
+        if any(k in lower_repo for k in ("mixtral", "deepseek-v", "qwen2-moe", "dbrx")):
+            is_moe = True
+
+        # 2. LoRA Adapter Check
+        is_lora = False
+        if any(f in ("adapter_config.json", "adapter_model.bin", "adapter_model.safetensors") for f in file_names):
+            is_lora = True
+        elif "lora" in lower_repo.split("/")[-1] or any("lora" in t for t in lower_tags):
+            is_lora = True
+        elif config_data.get("is_lora", False):
+            is_lora = True
+
+        # 3. Vision-Language (VLM) Check
+        is_vlm = False
+        has_mmproj = any("mmproj" in f for f in lower_files)
+        if has_mmproj:
+            is_vlm = True
+        elif config_data.get("image_token_index") is not None or "vision_config" in config_data or "visual" in config_data:
+            is_vlm = True
+        elif architecture_name and any(k in architecture_name.lower() for k in ("vl", "vision", "llava", "qwen2vl", "paligemma")):
+            is_vlm = True
+
+        # 4. ik_llama Quantization Check
+        is_ik_quant = False
+        for f in file_names:
+            upper_f = f.upper()
+            if any(ik_tag in upper_f for ik_tag in IK_QUANT_TAGS):
+                is_ik_quant = True
+                break
+        if variants:
+            for v in variants:
+                if v.quant.upper() in IK_QUANT_TAGS or v.is_ik_quant:
+                    is_ik_quant = True
+                    break
+
+        # 5. Quantization Format Classification
+        has_gguf = any(f.endswith(".gguf") for f in lower_files)
+        has_safetensors = any(f.endswith(".safetensors") for f in lower_files)
+
+        quant_cfg = config_data.get("quantization_config", {})
+        quant_method = str(quant_cfg.get("quant_method", "")).lower()
+
+        quant_format = "unknown"
+        if is_ik_quant:
+            quant_format = "gguf_ik"
+        elif has_gguf:
+            quant_format = "gguf_standard"
+        elif quant_method == "gptq" or "gptq" in lower_repo or any("gptq" in f for f in lower_files):
+            quant_format = "gptq"
+        elif quant_method == "awq" or "awq" in lower_repo or any("awq" in f for f in lower_files):
+            quant_format = "awq"
+        elif quant_method in ("fp8", "float8") or "fp8" in lower_repo or any("fp8" in f for f in lower_files):
+            quant_format = "fp8"
+        elif "exl2" in lower_repo or any(f.endswith(".exl2") for f in lower_files):
+            quant_format = "exl2"
+        elif quant_cfg.get("load_in_4bit", False):
+            quant_format = "bnb_4bit"
+        elif has_safetensors:
+            quant_format = "unquantized_fp16"
+
+        return {
+            "is_moe": is_moe,
+            "is_lora": is_lora,
+            "is_vlm": is_vlm,
+            "is_ik_quant": is_ik_quant,
+            "quant_format": quant_format,
+            "architecture_name": architecture_name,
+        }
+
     def _inspect_hf_repo(self, repo_id: str) -> InspectionResult:
-        """Inspects a Hugging Face Hub repository using files_metadata."""
+        """Inspects a Hugging Face Hub repository using files_metadata and config inspection."""
         try:
             info = self.api.model_info(repo_id, files_metadata=True)
         except Exception as e:
@@ -228,21 +351,48 @@ class ModelInspector:
 
         all_files: Dict[str, int] = {}
         total_size = 0
+        file_names = []
         for s in siblings:
             fname = getattr(s, "rfilename", "")
             fsize = getattr(s, "size", 0) or 0
             all_files[fname] = fsize
             total_size += fsize
+            file_names.append(fname)
+
+        # Attempt to load config.json if available
+        config_data: Dict[str, Any] = {}
+        if "config.json" in file_names:
+            try:
+                local_cfg = hf_hub_download(repo_id=repo_id, filename="config.json", token=self.hf_token)
+                with open(local_cfg, "r", encoding="utf-8") as f:
+                    config_data = json.load(f)
+            except Exception:
+                pass
+
+        if "adapter_config.json" in file_names and not config_data:
+            try:
+                local_cfg = hf_hub_download(repo_id=repo_id, filename="adapter_config.json", token=self.hf_token)
+                with open(local_cfg, "r", encoding="utf-8") as f:
+                    config_data = json.load(f)
+            except Exception:
+                pass
 
         # Classify files
         gguf_files = {f: sz for f, sz in all_files.items() if f.lower().endswith(".gguf")}
         safetensors_files = [f for f in all_files.keys() if f.lower().endswith(".safetensors")]
-
-        # Vision projector files
         mmproj_files = [f for f in gguf_files.keys() if "mmproj" in f.lower()]
 
-        # Parse GGUF variants (including split/sharded models)
+        # Parse GGUF variants
         gguf_variants = self._parse_gguf_variants(gguf_files, mmproj_files)
+
+        # Detect architecture flags
+        flags = self._extract_architecture_and_quant_flags(
+            config_data=config_data,
+            file_names=file_names,
+            repo_id=repo_id,
+            tags=tags,
+            variants=gguf_variants,
+        )
 
         # Detect model architecture type
         model_type, suggested_backend = self._classify_architecture(
@@ -251,7 +401,7 @@ class ModelInspector:
             tags=tags,
             has_gguf=len(gguf_files) > 0,
             has_safetensors=len(safetensors_files) > 0,
-            has_mmproj=len(mmproj_files) > 0
+            has_mmproj=len(mmproj_files) > 0 or flags["is_vlm"]
         )
 
         return InspectionResult(
@@ -267,7 +417,14 @@ class ModelInspector:
             mmproj_files=mmproj_files,
             safetensors_files=safetensors_files,
             primary_download_files=list(gguf_files.keys()) if gguf_files else safetensors_files,
-            suggested_backend=suggested_backend
+            suggested_backend=suggested_backend,
+            config_json=config_data,
+            is_moe=flags["is_moe"],
+            is_lora=flags["is_lora"],
+            is_vlm=flags["is_vlm"],
+            is_ik_quant=flags["is_ik_quant"],
+            quant_format=flags["quant_format"],
+            architecture_name=flags["architecture_name"],
         )
 
     def _inspect_hf_file(self, repo_id: str, file_path: str, raw_url: str) -> InspectionResult:
@@ -279,7 +436,6 @@ class ModelInspector:
         base_res.raw_source = raw_url
         target_fname = Path(file_path).name
 
-        # Match against gguf variants
         filtered_variants = []
         for v in base_res.gguf_variants:
             if target_fname in v.shard_files or target_fname == v.name:
@@ -300,8 +456,10 @@ class ModelInspector:
         backend = "llama.cpp" if is_gguf else "transformers"
 
         variants = []
+        is_ik = False
         if is_gguf:
             quant = self._extract_quant_tag(fname)
+            is_ik = any(ik_tag in fname.upper() for ik_tag in IK_QUANT_TAGS)
             variants.append(
                 GGUFVariant(
                     name=fname,
@@ -309,7 +467,8 @@ class ModelInspector:
                     is_split=False,
                     shard_files=[fname],
                     total_size_bytes=0,
-                    total_size_gb=0.0
+                    total_size_gb=0.0,
+                    is_ik_quant=is_ik
                 )
             )
 
@@ -320,7 +479,9 @@ class ModelInspector:
             model_type=model_type,
             primary_download_files=[fname],
             gguf_variants=variants,
-            suggested_backend=backend
+            suggested_backend="ik_llama" if is_ik else backend,
+            is_ik_quant=is_ik,
+            quant_format="gguf_ik" if is_ik else ("gguf_standard" if is_gguf else "unquantized_fp16")
         )
 
     def _inspect_civitai(self, url: str, resolved_input: Optional[ResolvedInput] = None) -> InspectionResult:
@@ -347,7 +508,7 @@ class ModelInspector:
                 suggested_backend="diffusers"
             )
         except Exception as e:
-            print(f"[ModelInspector] CivitAI API lookup note ({e}), returning default profile.")
+            print(f"[ModelInspector] CivitAI lookup note ({e}), returning default profile.")
             return InspectionResult(
                 source_type="civitai",
                 raw_source=url,
@@ -364,6 +525,8 @@ class ModelInspector:
             is_gguf = fname.lower().endswith(".gguf")
             model_type = "llm-gguf" if is_gguf else "llm-safetensors"
             quant = self._extract_quant_tag(fname) if is_gguf else "N/A"
+            is_ik = any(ik_tag in fname.upper() for ik_tag in IK_QUANT_TAGS)
+
             variants = [
                 GGUFVariant(
                     name=fname,
@@ -371,9 +534,12 @@ class ModelInspector:
                     is_split=False,
                     shard_files=[str(path.resolve())],
                     total_size_bytes=size,
-                    total_size_gb=size / (1024**3)
+                    total_size_gb=size / (1024**3),
+                    is_ik_quant=is_ik
                 )
             ] if is_gguf else []
+
+            backend = "ik_llama" if is_ik else ("llama.cpp" if is_gguf else "transformers")
 
             return InspectionResult(
                 source_type="local",
@@ -384,51 +550,89 @@ class ModelInspector:
                 total_repo_size_bytes=size,
                 gguf_variants=variants,
                 primary_download_files=[str(path.resolve())],
-                suggested_backend="llama.cpp" if is_gguf else "transformers"
+                suggested_backend=backend,
+                is_ik_quant=is_ik,
+                quant_format="gguf_ik" if is_ik else ("gguf_standard" if is_gguf else "unquantized_fp16")
             )
 
-        # Directory
+        # Directory inspection
         files = list(path.glob("**/*"))
+        file_names = [f.name for f in files]
         gguf_files = {str(f.relative_to(path)): f.stat().st_size for f in files if f.suffix.lower() == ".gguf"}
+        safetensors = [str(f.relative_to(path)) for f in files if f.suffix.lower() == ".safetensors"]
         mmproj = [f for f in gguf_files.keys() if "mmproj" in f.lower()]
         variants = self._parse_gguf_variants(gguf_files, mmproj)
+
+        config_data = {}
+        cfg_path = path / "config.json"
+        if cfg_path.is_file():
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    config_data = json.load(f)
+            except Exception:
+                pass
+
+        flags = self._extract_architecture_and_quant_flags(
+            config_data=config_data,
+            file_names=file_names,
+            repo_id=path.name,
+            variants=variants,
+        )
+
+        model_type, suggested_backend = self._classify_architecture(
+            repo_id=path.name,
+            pipeline_tag=None,
+            tags=[],
+            has_gguf=len(gguf_files) > 0,
+            has_safetensors=len(safetensors) > 0,
+            has_mmproj=len(mmproj) > 0 or flags["is_vlm"]
+        )
+
+        if flags["is_ik_quant"]:
+            suggested_backend = "ik_llama"
 
         return InspectionResult(
             source_type="local",
             raw_source=str(path),
             model_id=path.name,
-            model_type="llm-gguf" if gguf_files else "llm-safetensors",
+            model_type=model_type,
             total_files_count=len(files),
             total_repo_size_bytes=sum(f.stat().st_size for f in files if f.is_file()),
             gguf_variants=variants,
             mmproj_files=mmproj,
-            suggested_backend="llama.cpp" if gguf_files else "transformers"
+            safetensors_files=safetensors,
+            suggested_backend=suggested_backend,
+            config_json=config_data,
+            is_moe=flags["is_moe"],
+            is_lora=flags["is_lora"],
+            is_vlm=flags["is_vlm"],
+            is_ik_quant=flags["is_ik_quant"],
+            quant_format=flags["quant_format"],
+            architecture_name=flags["architecture_name"],
         )
 
     def _parse_gguf_variants(self, gguf_files: Dict[str, int], mmproj_files: List[str]) -> List[GGUFVariant]:
         """
         Parses all GGUF files in a repo, properly grouping split/sharded files
-        (e.g., *-00001-of-00003.gguf) into single logical variants with summed sizes.
+        into single logical variants with summed sizes.
         """
-        # Split regex: e.g. name-00001-of-00003.gguf
         split_pattern = re.compile(r"^(.*?)[.-](\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
-
         variants_map: Dict[str, Dict[str, Any]] = {}
         default_mmproj = mmproj_files[0] if mmproj_files else None
 
         for fname, size in gguf_files.items():
             if fname in mmproj_files:
-                continue  # mmproj is projector, not a standalone model variant
+                continue
 
             split_match = split_pattern.match(fname)
             if split_match:
                 base_name = split_match.group(1)
-                shard_idx = int(split_match.group(2))
                 total_shards = int(split_match.group(3))
                 key = f"{base_name} (Split {total_shards} shards)"
 
                 if key not in variants_map:
                     quant = self._extract_quant_tag(base_name)
+                    is_ik = any(ik in base_name.upper() for ik in IK_QUANT_TAGS)
                     variants_map[key] = {
                         "name": base_name,
                         "quant": quant,
@@ -436,12 +640,14 @@ class ModelInspector:
                         "shard_files": [],
                         "total_size": 0,
                         "mmproj": default_mmproj,
+                        "is_ik_quant": is_ik,
                     }
                 variants_map[key]["shard_files"].append(fname)
                 variants_map[key]["total_size"] += size
             else:
                 base_name = fname.replace(".gguf", "")
                 quant = self._extract_quant_tag(fname)
+                is_ik = any(ik in fname.upper() for ik in IK_QUANT_TAGS)
                 variants_map[fname] = {
                     "name": base_name,
                     "quant": quant,
@@ -449,11 +655,11 @@ class ModelInspector:
                     "shard_files": [fname],
                     "total_size": size,
                     "mmproj": default_mmproj,
+                    "is_ik_quant": is_ik,
                 }
 
         results = []
         for _, v in variants_map.items():
-            # sort shards cleanly by name
             v["shard_files"].sort()
             total_bytes = v["total_size"]
             total_gb = total_bytes / (1024**3)
@@ -466,10 +672,10 @@ class ModelInspector:
                     total_size_bytes=total_bytes,
                     total_size_gb=round(total_gb, 2),
                     mmproj_file=v["mmproj"],
+                    is_ik_quant=v.get("is_ik_quant", False),
                 )
             )
 
-        # Sort variants by quant quality ranking
         def sort_key(v: GGUFVariant):
             try:
                 return QUANT_ORDER.index(v.quant.upper())
@@ -481,7 +687,7 @@ class ModelInspector:
 
     @staticmethod
     def _extract_quant_tag(name: str) -> str:
-        """Extracts quantization tag from a filename (e.g. Q4_K_M, Q8_0, IQ4_XS)."""
+        """Extracts quantization tag from a filename."""
         upper = name.upper()
         for q in QUANT_ORDER:
             if q in upper:
@@ -489,7 +695,6 @@ class ModelInspector:
         for q in ["F16", "BF16", "F32"]:
             if q in upper:
                 return q
-        # Regex search for any Q[0-9] pattern
         m = re.search(r"(Q\d_[A-Z0-9_]+|IQ\d_[A-Z0-9_]+)", upper)
         if m:
             return m.group(1)
@@ -504,17 +709,13 @@ class ModelInspector:
         has_safetensors: bool,
         has_mmproj: bool
     ) -> Tuple[str, str]:
-        """
-        Classifies model architecture into:
-        llm-gguf, vlm-gguf, embedding-gguf, llm-safetensors, diffusion, audio
-        and suggests optimal backend engine.
-        """
+        """Classifies architecture into model_type and default backend engine."""
         lower_repo = repo_id.lower()
         lower_tags = [t.lower() for t in tags]
 
         # Audio check
         if pipeline_tag in ["automatic-speech-recognition", "text-to-speech", "audio-to-audio"] or "whisper" in lower_repo:
-            return "audio", "audio"
+            return "audio", "faster-whisper"
 
         # Diffusion check
         if pipeline_tag in ["text-to-image", "image-to-image"] or any("diffusers" in t or "stable-diffusion" in t for t in lower_tags):

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "universal-ai-workspace"
-version = "1.0.0"
-description = "Production-grade, shareable, multi-backend AI inference workspace for Google Colab with native CUDA acceleration"
+version = "1.1.0"
+description = "Modular multi-backend machine learning workspace for Google Colab and Linux workstations"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -13,7 +13,6 @@ authors = [
     { name = "Ali Mohammadi", email = "mr.alimohammadi111@gmail.com" }
 ]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -21,7 +20,6 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
     "fastapi>=0.100.0",
@@ -74,6 +72,31 @@ diffusion = [
 audio = [
     "faster-whisper>=1.0.0",
     "soundfile>=0.12.0",
+]
+unsloth = [
+    "unsloth",
+    "torch",
+    "transformers",
+    "accelerate",
+    "bitsandbytes",
+    "peft",
+    "trl",
+]
+gptqmodel = [
+    "gptqmodel",
+    "optimum",
+    "accelerate",
+]
+autoawq = [
+    "autoawq",
+    "accelerate",
+]
+exllamav2 = [
+    "exllamav2",
+]
+ct2 = [
+    "ctranslate2",
+    "faster-whisper",
 ]
 all = [
     "universal-ai-workspace[core,transformers,diffusion,audio]",

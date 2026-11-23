@@ -33,7 +33,7 @@ class ServerPreset(BaseModel):
 
 class WorkspaceSettings(BaseModel):
     workspace_name: str = "Universal AI Workspace"
-    workspace_mode: str = "hybrid"  # hybrid, local_ssd, google_drive, gdrive_relative, custom_path
+    workspace_mode: str = "local_ssd"  # local_ssd, hybrid, google_drive, gdrive_relative, custom_path
     drive_root: str = DEFAULT_DRIVE_ROOT
     runtime_root: str = DEFAULT_RUNTIME_ROOT
     default_backend: str = "llama.cpp"
@@ -69,8 +69,8 @@ class WorkspaceConfig:
                 mode = WorkspaceMode.CUSTOM_PATH
             ws_path = drive_root
         else:
-            mode = WorkspaceMode.HYBRID
-            ws_path = workspace_path or DEFAULT_DRIVE_ROOT
+            mode = WorkspaceMode.LOCAL_SSD
+            ws_path = workspace_path or FALLBACK_LOCAL_ROOT
 
         # Resolve paths using IOResolver
         self.paths: ResolvedWorkspacePaths = IOResolver.resolve_workspace_paths(
@@ -230,6 +230,23 @@ class WorkspaceConfig:
                 ctx_size=4096,
                 custom_args={"load_in_4bit": True, "device_map": "auto"},
                 description="Flexible fallback for Safetensors models on T4 GPUs."
+            ),
+            "ik_llama_moe": ServerPreset(
+                name="ik_llama.cpp MoE & IQ Hybrid",
+                backend="ik_llama",
+                ctx_size=4096,
+                n_gpu_layers=-1,
+                flash_attn=True,
+                cache_type_k="q8_0",
+                cache_type_v="q8_0",
+                description="Optimized engine for non-uniform IQ quants and MoE hybrid CPU/GPU offload."
+            ),
+            "unsloth_fast": ServerPreset(
+                name="Unsloth 4-Bit Fast Inference",
+                backend="unsloth",
+                ctx_size=4096,
+                custom_args={"load_in_4bit": True},
+                description="Unsloth FastLanguageModel engine for LoRA and 4-bit Safetensors."
             )
         }
         self.save_presets(defaults)

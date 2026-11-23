@@ -60,6 +60,34 @@ class EnvironmentManager:
             "faster-whisper",
             "soundfile",
         ],
+        "ik_llama": [
+            # ik_llama relies on native ik_llama.cpp binaries
+        ],
+        "unsloth": [
+            "unsloth",
+            "torch",
+            "transformers",
+            "accelerate",
+            "bitsandbytes",
+            "peft",
+            "trl",
+        ],
+        "gptqmodel": [
+            "gptqmodel",
+            "optimum",
+            "accelerate",
+        ],
+        "autoawq": [
+            "autoawq",
+            "accelerate",
+        ],
+        "exllamav2": [
+            "exllamav2",
+        ],
+        "ct2": [
+            "ctranslate2",
+            "faster-whisper",
+        ],
     }
 
     def __init__(self, config: Optional[WorkspaceConfig] = None):
@@ -169,7 +197,7 @@ class EnvironmentManager:
 
         # Local SSD extraction path for fast execution without FUSE overhead
         local_extract_dir = self.config.runtime_root / "bin" / f"llama_cpp_{tag_name}_{cuda_tag}"
-        key_binaries = ["llama-server", "llama-quantize", "llama-cli", "llama-bench"]
+        key_binaries = ["llama-server", "llama-quantize", "llama-cli", "llama-bench", "llama-imatrix", "llama-gguf-split"]
         found_binaries = {}
 
         # 1. Ensure main llama.cpp tarball is cached on Drive
@@ -371,6 +399,132 @@ class EnvironmentManager:
 
         return str(usr_bin)
 
+    def fetch_ik_llama_cpp(self, prebuilt_url: Optional[str] = None, force: bool = False) -> Dict[str, str]:
+        """
+        Locates or builds ikawrakow/ik_llama.cpp binaries.
+        Checks local runtime and Drive cache first, downloads prebuilt URL if provided,
+        or compiles with CUDA + Flash Attention support.
+        """
+        local_dir = self.config.runtime_root / "bin" / "ik_llama_cpp"
+        drive_cache_dir = self.config.bin_dir / "ik_llama_cpp"
+        key_bins = ["llama-server", "llama-quantize", "llama-cli"]
+        found: Dict[str, str] = {}
+
+        # 1. Check local runtime directory
+        if not force and local_dir.is_dir():
+            has_all = all((local_dir / b).exists() for b in ["llama-server", "llama-quantize"])
+            if has_all:
+                for b in key_bins:
+                    p = local_dir / b
+                    if p.exists():
+                        found[b] = str(p)
+                return found
+
+        # 2. Check persistent Drive cache
+        if not force and drive_cache_dir.is_dir():
+            has_drive = all((drive_cache_dir / b).exists() for b in ["llama-server", "llama-quantize"])
+            if has_drive:
+                print(f"[EnvManager] Restoring ik_llama.cpp binaries from Drive cache to {local_dir}...")
+                local_dir.mkdir(parents=True, exist_ok=True)
+                for b in key_bins:
+                    dp = drive_cache_dir / b
+                    lp = local_dir / b
+                    if dp.exists():
+                        shutil.copy2(str(dp), str(lp))
+                        lp.chmod(0o755)
+                        found[b] = str(lp)
+                return found
+
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        # 3. Download from prebuilt URL if provided
+        if prebuilt_url:
+            print(f"[EnvManager] Downloading prebuilt ik_llama.cpp from {prebuilt_url}...")
+            tar_tmp = self.config.runtime_root / "ik_llama_prebuilt.tar.gz"
+            try:
+                urllib.request.urlretrieve(prebuilt_url, str(tar_tmp))
+                subprocess.run(["tar", "-xzf", str(tar_tmp), "-C", str(local_dir)], check=False)
+                for b in key_bins:
+                    for candidate in local_dir.glob(f"**/{b}"):
+                        candidate.chmod(0o755)
+                        found[b] = str(candidate)
+                if found:
+                    return found
+            except Exception as e:
+                print(f"[EnvManager] Prebuilt download note ({e}), attempting source build...")
+
+        # 4. Source build with cmake
+        has_cmake = shutil.which("cmake") is not None
+        has_git = shutil.which("git") is not None
+
+        if has_cmake and has_git and self.hw.has_gpu:
+            print("[EnvManager] Compiling ikawrakow/ik_llama.cpp with CUDA and Flash Attention...")
+            src_dir = self.config.runtime_root / "src" / "ik_llama_cpp"
+            src_dir.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if not (src_dir / ".git").is_dir():
+                    subprocess.run(
+                        ["git", "clone", "--depth", "1", "https://github.com/ikawrakow/ik_llama.cpp.git", str(src_dir)],
+                        check=True
+                    )
+                build_dir = src_dir / "build"
+                cmake_config_cmd = [
+                    "cmake",
+                    "-B", str(build_dir),
+                    "-DGGML_CUDA=ON",
+                    "-DGGML_CUDA_FA_ALL_QUANTS=ON",
+                ]
+                subprocess.run(cmake_config_cmd, cwd=str(src_dir), check=True)
+                cmake_build_cmd = [
+                    "cmake",
+                    "--build", str(build_dir),
+                    "--config", "Release",
+                    "-j", str(max(2, os.cpu_count() or 2)),
+                    "--target", "llama-server", "llama-quantize"
+                ]
+                subprocess.run(cmake_build_cmd, cwd=str(src_dir), check=True)
+
+                for b in ["llama-server", "llama-quantize"]:
+                    built_file = build_dir / "bin" / b
+                    if not built_file.exists():
+                        candidates = list(build_dir.glob(f"**/{b}"))
+                        built_file = candidates[0] if candidates else None
+                    if built_file and built_file.exists():
+                        target = local_dir / b
+                        shutil.copy2(str(built_file), str(target))
+                        target.chmod(0o755)
+                        found[b] = str(target)
+
+                # Cache built binaries to Google Drive if available
+                if found and self.config.bin_dir.is_dir():
+                    try:
+                        drive_cache_dir.mkdir(parents=True, exist_ok=True)
+                        for b, p in found.items():
+                            shutil.copy2(p, str(drive_cache_dir / b))
+                        print(f"[EnvManager] Successfully cached ik_llama binaries to Drive: {drive_cache_dir}")
+                    except Exception:
+                        pass
+
+                if found:
+                    return found
+            except Exception as e:
+                print(f"[EnvManager] Compilation note ({e}), falling back to standard llama.cpp...")
+
+        # 5. Graceful fallback to standard llama.cpp binaries
+        print("[EnvManager] Using standard llama.cpp binary suite for ik_llama execution.")
+        std_bins = self.fetch_llama_cpp()
+        for b in key_bins:
+            if b in std_bins:
+                found[b] = std_bins[b]
+                local_b = local_dir / b
+                if not local_b.exists():
+                    try:
+                        shutil.copy2(std_bins[b], str(local_b))
+                        local_b.chmod(0o755)
+                    except Exception:
+                        pass
+        return found
+
     def install_profile(self, profile_name: str, isolate: bool = False) -> bool:
         """
         Installs an environment profile using uv with persistent cache on Google Drive.
@@ -380,6 +534,10 @@ class EnvironmentManager:
 
         if profile_name == "gguf":
             self.fetch_llama_cpp()
+            return True
+
+        if profile_name == "ik_llama":
+            self.fetch_ik_llama_cpp()
             return True
 
         packages = self.PROFILES[profile_name]
@@ -423,9 +581,12 @@ class EnvironmentManager:
     def verify_profile(self, profile_name: str) -> Dict[str, bool]:
         """Verifies whether required packages/binaries of a profile are accessible."""
         results = {}
-        if profile_name == "gguf":
+        if profile_name in ("gguf", "ik_llama"):
             for b in ["llama-server", "llama-quantize", "llama-cli"]:
-                results[b] = shutil.which(b) is not None
+                results[b] = (
+                    shutil.which(b) is not None
+                    or (self.config.runtime_root / "bin" / "ik_llama_cpp" / b).exists()
+                )
             return results
 
         import importlib.util

@@ -3,7 +3,7 @@ Universal AI Workspace for Google Colab
 Modular Python Core Package
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .config import WorkspaceConfig, ServerPreset, WorkspaceSettings, get_config
 from .io_resolver import (
@@ -27,10 +27,25 @@ from .engines import (
     BaseEngine,
     EngineStatus,
     LlamaCppEngine,
+    IKLlamaEngine,
     TransformersEngine,
+    UnslothEngine,
     VLLMEngine,
     DiffusersEngine,
     AudioEngine,
+)
+from .converters import (
+    BaseConverter,
+    ConversionResult,
+    LlamaCppConverter,
+    IKLlamaConverter,
+    UnslothConverter,
+    GPTQModelConverter,
+    AutoAWQConverter,
+    ExLlamaConverter,
+    CT2AudioConverter,
+    get_converter,
+    list_converters,
 )
 
 __all__ = [
@@ -67,8 +82,21 @@ __all__ = [
     "BaseEngine",
     "EngineStatus",
     "LlamaCppEngine",
+    "IKLlamaEngine",
     "TransformersEngine",
+    "UnslothEngine",
     "VLLMEngine",
     "DiffusersEngine",
     "AudioEngine",
+    "BaseConverter",
+    "ConversionResult",
+    "LlamaCppConverter",
+    "IKLlamaConverter",
+    "UnslothConverter",
+    "GPTQModelConverter",
+    "AutoAWQConverter",
+    "ExLlamaConverter",
+    "CT2AudioConverter",
+    "get_converter",
+    "list_converters",
 ]

@@ -20,7 +20,9 @@ import requests
 from .config import ServerPreset, WorkspaceConfig, get_config
 from .engines.base import BaseEngine
 from .engines.llama_cpp import LlamaCppEngine
+from .engines.ik_llama_engine import IKLlamaEngine
 from .engines.transformers_engine import TransformersEngine
+from .engines.unsloth_engine import UnslothEngine
 from .engines.vllm_engine import VLLMEngine
 from .engines.diffusers_engine import DiffusersEngine
 from .engines.audio_engine import AudioEngine
@@ -167,13 +169,17 @@ class ProcessManager:
             if not self.current_engine:
                 if backend_name == "llama.cpp":
                     self.current_engine = LlamaCppEngine(self.config)
+                elif backend_name in ("ik_llama", "ik_llama.cpp"):
+                    self.current_engine = IKLlamaEngine(self.config)
                 elif backend_name == "transformers":
                     self.current_engine = TransformersEngine(self.config)
+                elif backend_name == "unsloth":
+                    self.current_engine = UnslothEngine(self.config)
                 elif backend_name == "vllm":
                     self.current_engine = VLLMEngine(self.config)
                 elif backend_name == "diffusers":
                     self.current_engine = DiffusersEngine(self.config)
-                elif backend_name == "audio":
+                elif backend_name in ("audio", "faster-whisper"):
                     self.current_engine = AudioEngine(self.config)
                 else:
                     self.current_engine = LlamaCppEngine(self.config)
@@ -255,23 +261,32 @@ class ProcessManager:
                 overrides["cache_type_v"] = recommendation.cache_type_v
 
         # Select engine backend
-        backend = preset.backend if preset else "llama.cpp"
-        if entry.type in ["llm-gguf", "vlm-gguf", "embedding-gguf"]:
-            backend = "llama.cpp"
-        elif entry.type == "diffusion":
-            backend = "diffusers"
-        elif entry.type == "audio":
-            backend = "audio"
+        backend = overrides.pop("backend", None)
+        if not backend and recommendation and getattr(recommendation, "recommended_engine", None):
+            backend = recommendation.recommended_engine
+        if not backend:
+            backend = preset.backend if preset else "llama.cpp"
+            if entry.type in ["llm-gguf", "vlm-gguf", "embedding-gguf"]:
+                backend = "llama.cpp"
+            elif entry.type == "diffusion":
+                backend = "diffusers"
+            elif entry.type == "audio":
+                backend = "audio"
 
-        if backend == "llama.cpp":
+        backend_clean = backend.lower().strip()
+        if backend_clean in ("llama.cpp", "llama_cpp"):
             self.current_engine = LlamaCppEngine(self.config)
-        elif backend == "vllm":
+        elif backend_clean in ("ik_llama", "ik_llama.cpp"):
+            self.current_engine = IKLlamaEngine(self.config)
+        elif backend_clean == "unsloth":
+            self.current_engine = UnslothEngine(self.config)
+        elif backend_clean == "vllm":
             self.current_engine = VLLMEngine(self.config)
-        elif backend == "transformers":
+        elif backend_clean in ("transformers", "exllamav2"):
             self.current_engine = TransformersEngine(self.config)
-        elif backend == "diffusers":
+        elif backend_clean == "diffusers":
             self.current_engine = DiffusersEngine(self.config)
-        elif backend == "audio":
+        elif backend_clean in ("audio", "faster-whisper"):
             self.current_engine = AudioEngine(self.config)
         else:
             self.current_engine = LlamaCppEngine(self.config)

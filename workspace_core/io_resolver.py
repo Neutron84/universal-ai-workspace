@@ -1,7 +1,7 @@
 """
 Universal I/O & Storage Mode Resolver
-Provides unified URI abstraction, multi-source input resolution,
-flexible workspace storage modes, and multi-sink output/artifact export.
+Provides URI abstraction, multi-source input resolution,
+workspace storage modes, and artifact export sinks.
 """
 
 from dataclasses import dataclass, field
@@ -23,33 +23,43 @@ from .security import SecurityManager
 
 
 class WorkspaceMode(str, Enum):
-    HYBRID = "hybrid"                    # Fast Local SSD runtime + persistent sync to Google Drive
-    LOCAL_SSD = "local_ssd"              # 100% ephemeral SSD (/content/ai_workspace), zero Drive requirement
+    LOCAL_SSD = "local_ssd"              # Local SSD storage (/content/ai_workspace), zero Drive requirement
+    HYBRID = "hybrid"                    # Local SSD runtime with Google Drive persistence
     GOOGLE_DRIVE = "google_drive"        # Persistent workspace at explicit Drive path
     GDRIVE_RELATIVE = "gdrive_relative"  # Relative path under /content/drive/MyDrive/<path>
-    CUSTOM_PATH = "custom_path"          # Arbitrary directory (Shared Drive, rclone mount, Kaggle, etc.)
+    CUSTOM_PATH = "custom_path"          # Custom mounted directory
 
 
 class InputMode(str, Enum):
     AUTO = "auto"                        # Auto-detect from URI scheme or pattern
     HUGGINGFACE = "huggingface"          # hf://org/repo, https://huggingface.co/..., or org/repo
-    DIRECT = "direct"                    # direct:///abs/path or existing local path
+    DIRECT_UPLOAD = "direct_upload"      # Interactive file upload via Colab/Gradio
+    LOCAL_PATH = "local_path"            # direct:///abs/path or existing local path
     GOOGLE_DRIVE = "google_drive"        # /content/drive/MyDrive/...
-    GDRIVE_RELATIVE = "gdrive_relative"  # gdrive://folder/model.gguf
+    GDRIVE_RELATIVE = "gdrive_relative"  # gdrive://folder/model.gguf or relative path
     GDRIVE_SHARE = "gdrive_share"        # gshare://<id> or https://drive.google.com/file/d/<id>/...
     URL = "url"                          # http:// or https:// direct download
     CIVITAI = "civitai"                  # civitai://<id> or https://civitai.com/...
     GIT_REPO = "git_repo"                # git://... or .git URL
-    COLAB_UPLOAD = "colab_upload"        # Interactive file upload via Colab/Gradio
+
+    # Backward compatibility aliases
+    DIRECT = "local_path"
+    COLAB_UPLOAD = "direct_upload"
 
 
 class OutputMode(str, Enum):
+    NONE = "none"                        # No export
     LOCAL_SSD = "local_ssd"              # Save/copy to /content/runtime/outputs
+    DIRECT_DOWNLOAD = "direct_download"  # Trigger Colab browser download (auto-zipping if requested/folder)
     GOOGLE_DRIVE = "google_drive"        # Copy to Google Drive persistent storage
     GDRIVE_RELATIVE = "gdrive_relative"  # Copy relative to /content/drive/MyDrive/
-    HUGGINGFACE_UPLOAD = "huggingface_upload" # Upload to HF Hub repo via HfApi
-    BROWSER_DOWNLOAD = "browser_download"     # Trigger Colab browser download (auto-zipping folders)
+    GDRIVE_DIRECT = "gdrive_direct"      # Write directly into Google Drive path without staging
+    HUGGINGFACE_HUB = "huggingface_hub"  # Upload to HF Hub repo via HfApi
     CUSTOM_PATH = "custom_path"          # Copy to arbitrary mounted directory
+
+    # Backward compatibility aliases
+    BROWSER_DOWNLOAD = "direct_download"
+    HUGGINGFACE_UPLOAD = "huggingface_hub"
 
 
 @dataclass
@@ -92,11 +102,22 @@ class IOResolver:
     """Resolves workspace storage modes, input URIs, and artifact sinks."""
 
     @staticmethod
+    def needs_drive(
+        code_source: Optional[str] = None,
+        workspace_mode: Optional[str] = None,
+        input_type: Optional[str] = None,
+        output_type: Optional[str] = None,
+    ) -> bool:
+        """Determines whether Google Drive must be mounted based on chosen modes."""
+        drive_indicators = {"google_drive", "gdrive_relative", "gdrive_direct", "hybrid"}
+        for val in (code_source, workspace_mode, input_type, output_type):
+            if val and str(val).strip().lower() in drive_indicators:
+                return True
+        return False
+
+    @staticmethod
     def ensure_google_drive_mounted(mount_point: str = "/content/drive") -> bool:
-        """
-        Attempts to mount Google Drive if running in Google Colab.
-        Returns True if /content/drive/MyDrive exists, False otherwise.
-        """
+        """Attempts to mount Google Drive if running in Google Colab."""
         if Path("/content/drive/MyDrive").is_dir():
             return True
 
@@ -106,32 +127,34 @@ class IOResolver:
             drive.mount(mount_point)
             return Path("/content/drive/MyDrive").is_dir()
         except Exception as e:
-            print(f"[IOResolver] Note: Google Drive not mounted ({e}). Operating in Local SSD mode.")
+            print(f"[IOResolver] Google Drive not mounted ({e}). Operating in Local SSD mode.")
             return False
 
     @classmethod
     def resolve_workspace_paths(
         cls,
-        mode: Union[str, WorkspaceMode] = WorkspaceMode.HYBRID,
+        mode: Union[str, WorkspaceMode] = WorkspaceMode.LOCAL_SSD,
         workspace_path: Optional[str] = None,
         runtime_root: Optional[str] = None,
     ) -> ResolvedWorkspacePaths:
-        """
-        Resolves workspace directories based on the selected WorkspaceMode.
-        Auto-mounts Google Drive if required, gracefully falling back to local SSD.
-        """
+        """Resolves workspace directories based on the selected WorkspaceMode."""
         if isinstance(mode, str):
+            clean_mode = mode.lower().strip()
             try:
-                w_mode = WorkspaceMode(mode.lower())
+                w_mode = WorkspaceMode(clean_mode)
             except ValueError:
-                w_mode = WorkspaceMode.HYBRID
+                w_mode = WorkspaceMode.LOCAL_SSD
         else:
             w_mode = mode
 
         rt_root = Path(runtime_root or "/content/runtime").resolve()
         drive_mounted = False
 
-        if w_mode == WorkspaceMode.HYBRID:
+        if w_mode == WorkspaceMode.LOCAL_SSD:
+            ws_root = Path(workspace_path or "/content/ai_workspace").resolve()
+            drive_mounted = False
+
+        elif w_mode == WorkspaceMode.HYBRID:
             drive_mounted = cls.ensure_google_drive_mounted()
             if drive_mounted:
                 ws_str = (workspace_path or "AI_Workspace").strip()
@@ -141,15 +164,9 @@ class IOResolver:
                     rel = ws_str.lstrip("/")
                     ws_root = Path("/content/drive/MyDrive") / rel
             else:
-                # Graceful degradation to local SSD
-                print("[IOResolver] Warning: Google Drive unavailable for Hybrid mode. Falling back to local_ssd mode.")
+                print("[IOResolver] Google Drive unavailable for Hybrid mode. Operating in Local SSD mode.")
                 w_mode = WorkspaceMode.LOCAL_SSD
                 ws_root = Path(workspace_path or "/content/ai_workspace").resolve()
-
-        elif w_mode == WorkspaceMode.LOCAL_SSD:
-            # 100% ephemeral local SSD — zero Drive dependency
-            ws_root = Path(workspace_path or "/content/ai_workspace").resolve()
-            drive_mounted = False
 
         elif w_mode == WorkspaceMode.GOOGLE_DRIVE:
             drive_mounted = cls.ensure_google_drive_mounted()
@@ -171,7 +188,6 @@ class IOResolver:
         else:
             ws_root = Path(workspace_path or "/content/ai_workspace").resolve()
 
-        # Build paths
         configs_dir = ws_root / "configs"
         cache_dir = ws_root / "cache"
         models_dir = ws_root / "models"
@@ -200,7 +216,6 @@ class IOResolver:
             drive_mounted=drive_mounted,
         )
 
-        # Create necessary directories
         for d in [
             paths.workspace_root,
             paths.configs_dir,
@@ -232,8 +247,8 @@ class IOResolver:
         if not raw:
             return InputMode.AUTO
 
-        if raw.lower() == "colab_upload":
-            return InputMode.COLAB_UPLOAD
+        if raw.lower() in ("colab_upload", "direct_upload"):
+            return InputMode.DIRECT_UPLOAD
 
         if raw.startswith("hf://"):
             return InputMode.HUGGINGFACE
@@ -250,7 +265,7 @@ class IOResolver:
             return InputMode.GDRIVE_RELATIVE
 
         if raw.startswith("direct://"):
-            return InputMode.DIRECT
+            return InputMode.LOCAL_PATH
 
         if raw.startswith("civitai://") or "civitai.com" in raw:
             return InputMode.CIVITAI
@@ -268,15 +283,39 @@ class IOResolver:
         if raw.startswith("/content/drive/MyDrive"):
             return InputMode.GOOGLE_DRIVE
 
-        # Check existing filesystem path
         if Path(raw).exists():
-            return InputMode.DIRECT
+            return InputMode.LOCAL_PATH
 
-        # Standard Hugging Face repo format (e.g., "org/model-name")
         if re.match(r"^[a-zA-Z0-9_\-\.]+\/[a-zA-Z0-9_\-\.]+$", raw):
             return InputMode.HUGGINGFACE
 
         return InputMode.AUTO
+
+    @classmethod
+    def unpack_if_archive(cls, archive_path: Path, dest_dir: Optional[Path] = None) -> Path:
+        """Extracts zip or tar archives into dest_dir if applicable."""
+        archive_path = Path(archive_path).resolve()
+        if not archive_path.is_file():
+            return archive_path
+
+        name = archive_path.name.lower()
+        target_dir = dest_dir or (archive_path.parent / archive_path.stem)
+
+        if name.endswith(".zip"):
+            print(f"[IOResolver] Extracting zip archive: {archive_path} -> {target_dir}")
+            target_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(str(archive_path), "r") as z:
+                z.extractall(str(target_dir))
+            return target_dir
+
+        if name.endswith((".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tar")):
+            print(f"[IOResolver] Extracting tar archive: {archive_path} -> {target_dir}")
+            target_dir.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(str(archive_path), "r:*") as t:
+                t.extractall(path=str(target_dir))
+            return target_dir
+
+        return archive_path
 
     @classmethod
     def resolve_input(
@@ -286,18 +325,23 @@ class IOResolver:
         download_dir: Optional[Path] = None,
         hf_token: Optional[str] = None,
         civitai_token: Optional[str] = None,
+        unpack_archive: bool = True,
+        input_file: Optional[str] = None,
     ) -> ResolvedInput:
-        """
-        Parses and resolves any input URI into a structured ResolvedInput.
-        Supports downloading from Google Drive shares via gdown, CivitAI API,
-        HuggingFace Hub, direct URLs via aria2c, and git shallow clones.
-        """
+        """Parses and resolves input URIs into a structured ResolvedInput."""
         raw = uri.strip()
         if isinstance(mode, str):
-            try:
-                in_mode = InputMode(mode.lower())
-            except ValueError:
-                in_mode = InputMode.AUTO
+            clean_mode = mode.lower().strip()
+            # Handle aliases
+            if clean_mode in ("direct", "local_dir", "local"):
+                in_mode = InputMode.LOCAL_PATH
+            elif clean_mode in ("colab_upload", "upload"):
+                in_mode = InputMode.DIRECT_UPLOAD
+            else:
+                try:
+                    in_mode = InputMode(clean_mode)
+                except ValueError:
+                    in_mode = InputMode.AUTO
         else:
             in_mode = mode
 
@@ -309,12 +353,11 @@ class IOResolver:
             clean = raw
             if clean.startswith("hf://"):
                 clean = clean[5:]
-            # Parse possible URL
             if "huggingface.co" in clean:
                 m = re.search(r"huggingface\.co/([^/]+/[^/]+)(?:/(?:resolve|blob)/[^/]+/(.+))?", clean)
                 if m:
                     repo_id = m.group(1)
-                    subpath = m.group(2)
+                    subpath = input_file or m.group(2)
                     return ResolvedInput(
                         mode=InputMode.HUGGINGFACE,
                         raw_uri=raw,
@@ -325,7 +368,7 @@ class IOResolver:
             parts = clean.split("/", 2)
             if len(parts) >= 2:
                 repo_id = f"{parts[0]}/{parts[1]}"
-                subpath = parts[2] if len(parts) > 2 else None
+                subpath = input_file or (parts[2] if len(parts) > 2 else None)
                 return ResolvedInput(
                     mode=InputMode.HUGGINGFACE,
                     raw_uri=raw,
@@ -337,33 +380,44 @@ class IOResolver:
                 mode=InputMode.HUGGINGFACE,
                 raw_uri=raw,
                 resolved_type="hf_repo",
-                identifier=clean
+                identifier=clean,
+                subpath_or_file=input_file
             )
 
-        # 2. Direct Local File / Directory
-        if in_mode == InputMode.DIRECT:
+        # 2. Local Path
+        if in_mode in (InputMode.LOCAL_PATH, InputMode.DIRECT):
             clean = raw
             if clean.startswith("direct://"):
                 clean = clean[9:]
             p = Path(clean).resolve()
+            if input_file and p.is_dir():
+                p = p / input_file
+            if unpack_archive and p.is_file():
+                p = cls.unpack_if_archive(p)
             return ResolvedInput(
-                mode=InputMode.DIRECT,
+                mode=InputMode.LOCAL_PATH,
                 raw_uri=raw,
                 resolved_type="direct_local",
                 identifier=p.name,
-                local_path=p
+                local_path=p,
+                subpath_or_file=input_file
             )
 
         # 3. Google Drive Absolute Path
         if in_mode == InputMode.GOOGLE_DRIVE:
             cls.ensure_google_drive_mounted()
             p = Path(raw).resolve()
+            if input_file and p.is_dir():
+                p = p / input_file
+            if unpack_archive and p.is_file():
+                p = cls.unpack_if_archive(p)
             return ResolvedInput(
                 mode=InputMode.GOOGLE_DRIVE,
                 raw_uri=raw,
                 resolved_type="direct_local",
                 identifier=p.name,
-                local_path=p
+                local_path=p,
+                subpath_or_file=input_file
             )
 
         # 4. Google Drive Relative Path
@@ -377,12 +431,38 @@ class IOResolver:
             else:
                 rel = clean.lstrip("/")
                 p = Path("/content/drive/MyDrive") / rel
+
+            # Support copying single file or entire folder to local working directory
+            target_p = p
+            if p.exists() and download_dir:
+                download_dir = Path(download_dir).resolve()
+                download_dir.mkdir(parents=True, exist_ok=True)
+                if p.is_dir():
+                    dest_folder = download_dir / p.name
+                    if not dest_folder.exists():
+                        print(f"[IOResolver] Copying Google Drive folder {p} to local directory {dest_folder}...")
+                        shutil.copytree(str(p), str(dest_folder), dirs_exist_ok=True)
+                    target_p = dest_folder
+                elif p.is_file():
+                    dest_file = download_dir / p.name
+                    if not dest_file.exists():
+                        print(f"[IOResolver] Copying Google Drive file {p} to local directory {dest_file}...")
+                        shutil.copy2(str(p), str(dest_file))
+                    target_p = dest_file
+
+            if input_file and target_p.is_dir():
+                target_p = target_p / input_file
+
+            if unpack_archive and target_p.is_file():
+                target_p = cls.unpack_if_archive(target_p)
+
             return ResolvedInput(
                 mode=InputMode.GDRIVE_RELATIVE,
                 raw_uri=raw,
                 resolved_type="direct_local",
-                identifier=p.name,
-                local_path=p
+                identifier=target_p.name,
+                local_path=target_p,
+                subpath_or_file=input_file
             )
 
         # 5. Google Drive Public Share via gdown
@@ -394,6 +474,7 @@ class IOResolver:
                 raw_uri=raw,
                 resolved_type="gdrive_share",
                 identifier=file_or_folder_id,
+                subpath_or_file=input_file,
                 extra_metadata={"is_folder": is_folder, "id": file_or_folder_id}
             )
 
@@ -405,6 +486,7 @@ class IOResolver:
                 raw_uri=raw,
                 resolved_type="civitai",
                 identifier=str(model_id),
+                subpath_or_file=input_file,
                 extra_metadata={"model_id": model_id, "version_id": version_id}
             )
 
@@ -419,6 +501,7 @@ class IOResolver:
                 raw_uri=clean,
                 resolved_type="git_repo",
                 identifier=repo_name,
+                subpath_or_file=input_file,
                 extra_metadata={"clone_url": clean}
             )
 
@@ -429,74 +512,71 @@ class IOResolver:
                 mode=InputMode.URL,
                 raw_uri=raw,
                 resolved_type="url",
-                identifier=fname
+                identifier=fname,
+                subpath_or_file=input_file
             )
 
-        # 9. Interactive Colab / UI Upload
-        if in_mode == InputMode.COLAB_UPLOAD:
+        # 9. Interactive Direct Upload
+        if in_mode in (InputMode.DIRECT_UPLOAD, InputMode.COLAB_UPLOAD):
             return ResolvedInput(
-                mode=InputMode.COLAB_UPLOAD,
+                mode=InputMode.DIRECT_UPLOAD,
                 raw_uri=raw,
-                resolved_type="colab_upload",
-                identifier="colab_upload"
+                resolved_type="direct_upload",
+                identifier="direct_upload",
+                subpath_or_file=input_file
             )
 
         return ResolvedInput(
             mode=InputMode.AUTO,
             raw_uri=raw,
             resolved_type="unknown",
-            identifier=raw
+            identifier=raw,
+            subpath_or_file=input_file
         )
 
     @staticmethod
     def _extract_gdrive_id(uri: str) -> str:
-        """Extracts Google Drive file or folder ID from various link formats."""
+        """Extracts file or folder ID from Google Drive sharing URLs."""
         if uri.startswith("gshare://"):
             return uri[9:].strip("/")
-
-        # Format: /file/d/<id>/
-        m = re.search(r"/file/d/([a-zA-Z0-9_\-]+)", uri)
+        m = re.search(r"/(?:file/d|folders|open\?id=)/([a-zA-Z0-9_\-]+)", uri)
         if m:
             return m.group(1)
-
-        # Format: /drive/folders/<id>
-        m = re.search(r"/folders/([a-zA-Z0-9_\-]+)", uri)
-        if m:
-            return m.group(1)
-
-        # Format: ?id=<id>
         parsed = urlparse(uri)
         qs = parse_qs(parsed.query)
         if "id" in qs:
             return qs["id"][0]
-
-        return uri.strip("/")
+        return uri.strip()
 
     @staticmethod
     def _extract_civitai_ids(uri: str) -> Tuple[str, Optional[str]]:
-        """Extracts model_id and optional modelVersionId from CivitAI URLs or URIs."""
-        clean = uri
+        """Extracts model ID and optional version ID from CivitAI URLs."""
+        clean = uri.strip()
         if clean.startswith("civitai://"):
             clean = clean[10:]
+            parts = clean.split("/")
+            return parts[0], parts[1] if len(parts) > 1 else None
 
+        m = re.search(r"civitai\.com/models/(\d+)", clean)
+        model_id = m.group(1) if m else clean
+
+        version_id = None
         parsed = urlparse(clean)
         qs = parse_qs(parsed.query)
-        version_id = qs.get("modelVersionId", [None])[0]
-
-        # e.g. /models/12345 or /models/12345/model-name
-        m = re.search(r"(?:models/)?([0-9]+)", clean)
-        model_id = m.group(1) if m else clean.split("?")[0].strip("/")
+        if "modelVersionId" in qs:
+            version_id = qs["modelVersionId"][0]
 
         return model_id, version_id
 
     @classmethod
     def download_gdrive_share(cls, share_id: str, out_dir: Path, is_folder: bool = False) -> Path:
-        """Downloads a public Google Drive file or folder using gdown."""
+        """Downloads public Google Drive shares using gdown."""
+        out_dir = Path(out_dir).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
+
         try:
-            import gdown  # type: ignore
+            import gdown
         except ImportError:
-            print("[IOResolver] Installing gdown for Google Drive share resolution...")
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "gdown"], check=True)
             import gdown
 
@@ -517,10 +597,7 @@ class IOResolver:
         version_id: Optional[str] = None,
         api_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Queries CivitAI API (/api/v1/models/<id>) to retrieve download URLs,
-        metadata, files, and format specifications.
-        """
+        """Queries CivitAI API (/api/v1/models/<id>) to retrieve metadata and download URLs."""
         import urllib.request
         key = api_key or os.environ.get("CIVITAI_API_KEY")
 
@@ -576,17 +653,17 @@ class IOResolver:
         repo_name = Path(clone_url).stem
         dest = out_dir / repo_name
         if dest.exists() and (dest / ".git").is_dir():
-            print(f"[IOResolver] Git repo already cloned at {dest}.")
+            print(f"[IOResolver] Git repository already present at {dest}.")
             return dest
 
-        print(f"[IOResolver] Shallow cloning git repo {clone_url} -> {dest}...")
+        print(f"[IOResolver] Shallow cloning git repository {clone_url} -> {dest}...")
         cmd = ["git", "clone", "--depth", "1", clone_url, str(dest)]
         subprocess.run(cmd, check=True)
         return dest
 
 
 class OutputManager:
-    """Manages universal artifact export to local SSD, Google Drive, HuggingFace Hub, or browser."""
+    """Manages artifact export to Local SSD, Google Drive, HuggingFace Hub, or browser."""
 
     def __init__(self, paths: ResolvedWorkspacePaths, hf_token: Optional[str] = None):
         self.paths = paths
@@ -597,22 +674,28 @@ class OutputManager:
         source_path: Union[str, Path],
         output_mode: Union[str, OutputMode] = OutputMode.LOCAL_SSD,
         destination: Optional[str] = None,
+        output_name: Optional[str] = None,
+        zip_output: bool = False,
         hf_repo_id: Optional[str] = None,
         subpath_in_dest: Optional[str] = None,
+        cleanup_source: bool = False,
     ) -> Dict[str, Any]:
-        """
-        Exports an artifact (model file, folder, image, benchmark log) to the chosen sink.
-        Returns a dict summarizing the export result and destination URL or path.
-        """
+        """Exports an artifact to the designated sink with support for zipping, renaming, and source cleanup."""
         src = Path(source_path).resolve()
         if not src.exists():
             raise FileNotFoundError(f"Artifact source does not exist: {src}")
 
         if isinstance(output_mode, str):
-            try:
-                mode = OutputMode(output_mode.lower())
-            except ValueError:
-                mode = OutputMode.LOCAL_SSD
+            clean_mode = output_mode.lower().strip()
+            if clean_mode in ("browser_download", "download"):
+                mode = OutputMode.DIRECT_DOWNLOAD
+            elif clean_mode in ("huggingface_upload", "hf_hub"):
+                mode = OutputMode.HUGGINGFACE_HUB
+            else:
+                try:
+                    mode = OutputMode(clean_mode)
+                except ValueError:
+                    mode = OutputMode.LOCAL_SSD
         else:
             mode = output_mode
 
@@ -624,23 +707,74 @@ class OutputManager:
             "message": "",
         }
 
+        # 0. None (Retain artifact in place without export)
+        if mode == OutputMode.NONE:
+            result.update({
+                "success": True,
+                "exported_path": str(src),
+                "message": f"Artifact retained at source: {src}",
+            })
+            return result
+
+        # Determine target name
+        target_name = output_name or src.name
+
         # 1. Local SSD export
         if mode == OutputMode.LOCAL_SSD:
             out_dir = Path(destination).resolve() if destination else self.paths.runtime_outputs_dir
             out_dir.mkdir(parents=True, exist_ok=True)
-            target = out_dir / src.name
-            if src.is_dir():
-                shutil.copytree(str(src), str(target), dirs_exist_ok=True)
+            target = out_dir / target_name
+
+            if zip_output and not target_name.endswith(".zip"):
+                zip_target = out_dir / f"{target_name}.zip"
+                print(f"[OutputManager] Zipping artifact to Local SSD: {zip_target}...")
+                if src.is_dir():
+                    shutil.make_archive(str(zip_target.with_suffix("")), "zip", str(src))
+                else:
+                    with zipfile.ZipFile(str(zip_target), "w", zipfile.ZIP_DEFLATED) as zf:
+                        zf.write(str(src), arcname=src.name)
+                target = zip_target
             else:
-                shutil.copy2(str(src), str(target))
+                if src.is_dir():
+                    shutil.copytree(str(src), str(target), dirs_exist_ok=True)
+                elif src != target:
+                    shutil.copy2(str(src), str(target))
+
             result.update({
                 "success": True,
                 "exported_path": str(target),
                 "message": f"Artifact saved to Local SSD: {target}",
             })
+            self._handle_cleanup(src, target, cleanup_source)
             return result
 
-        # 2. Google Drive / GDrive Relative export
+        # 2. Google Drive direct write (no local copy staging, zipping disabled)
+        if mode == OutputMode.GDRIVE_DIRECT:
+            IOResolver.ensure_google_drive_mounted()
+            rel = (destination or "AI_Workspace/outputs").strip()
+            if rel.startswith("/content/drive/MyDrive"):
+                dest_dir = Path(rel).resolve()
+            else:
+                dest_dir = Path("/content/drive/MyDrive") / rel.lstrip("/")
+
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            target = dest_dir / target_name
+
+            print(f"[OutputManager] Writing artifact directly to Google Drive: {src} -> {target}...")
+            if src.is_dir():
+                shutil.copytree(str(src), str(target), dirs_exist_ok=True)
+            elif src != target:
+                shutil.copy2(str(src), str(target))
+
+            result.update({
+                "success": True,
+                "exported_path": str(target),
+                "message": f"Artifact written directly to Google Drive: {target}",
+            })
+            self._handle_cleanup(src, target, cleanup_source)
+            return result
+
+        # 3. Google Drive / GDrive Relative export (staged or direct, optional zipping)
         if mode in (OutputMode.GOOGLE_DRIVE, OutputMode.GDRIVE_RELATIVE):
             IOResolver.ensure_google_drive_mounted()
             if mode == OutputMode.GDRIVE_RELATIVE:
@@ -653,29 +787,47 @@ class OutputManager:
                 dest_dir = Path(destination or str(self.paths.models_dir)).resolve()
 
             dest_dir.mkdir(parents=True, exist_ok=True)
-            target = dest_dir / src.name
-            print(f"[OutputManager] Syncing artifact to Drive: {src} -> {target}...")
-            if src.is_dir():
-                shutil.copytree(str(src), str(target), dirs_exist_ok=True)
+
+            if zip_output and not target_name.endswith(".zip"):
+                zip_name = f"{target_name}.zip"
+                temp_zip = self.paths.runtime_outputs_dir / zip_name
+                print(f"[OutputManager] Packaging artifact into zip: {temp_zip}...")
+                if src.is_dir():
+                    shutil.make_archive(str(temp_zip.with_suffix("")), "zip", str(src))
+                else:
+                    with zipfile.ZipFile(str(temp_zip), "w", zipfile.ZIP_DEFLATED) as zf:
+                        zf.write(str(src), arcname=src.name)
+                target = dest_dir / zip_name
+                shutil.copy2(str(temp_zip), str(target))
+                try:
+                    temp_zip.unlink()
+                except Exception:
+                    pass
             else:
-                shutil.copy2(str(src), str(target))
+                target = dest_dir / target_name
+                print(f"[OutputManager] Copying artifact to Google Drive: {src} -> {target}...")
+                if src.is_dir():
+                    shutil.copytree(str(src), str(target), dirs_exist_ok=True)
+                elif src != target:
+                    shutil.copy2(str(src), str(target))
 
             result.update({
                 "success": True,
                 "exported_path": str(target),
-                "message": f"Artifact safely backed up to Google Drive: {target}",
+                "message": f"Artifact saved to Google Drive: {target}",
             })
+            self._handle_cleanup(src, target, cleanup_source)
             return result
 
-        # 3. Hugging Face Hub Upload
-        if mode == OutputMode.HUGGINGFACE_UPLOAD:
+        # 4. Hugging Face Hub Upload
+        if mode == OutputMode.HUGGINGFACE_HUB:
             target_repo = hf_repo_id or destination
             if not target_repo:
-                raise ValueError("hf_repo_id or destination must be provided for Hugging Face upload.")
+                raise ValueError("hf_repo_id or destination (username/repo-name) must be provided for Hugging Face upload.")
 
             from huggingface_hub import HfApi  # type: ignore
             api = HfApi(token=self.hf_token)
-            path_in_repo = subpath_in_dest or src.name
+            path_in_repo = subpath_in_dest or target_name
 
             print(f"[OutputManager] Uploading {src} to Hugging Face Hub ({target_repo})...")
             if src.is_dir():
@@ -699,15 +851,20 @@ class OutputManager:
                 "exported_path": hf_url,
                 "message": f"Uploaded successfully to Hugging Face Hub: {hf_url}",
             })
+            self._handle_cleanup(src, None, cleanup_source)
             return result
 
-        # 4. Browser Download (Colab files.download)
-        if mode == OutputMode.BROWSER_DOWNLOAD:
+        # 5. Direct Browser Download (Colab files.download)
+        if mode == OutputMode.DIRECT_DOWNLOAD:
             download_target = src
-            if src.is_dir():
-                zip_path = self.paths.runtime_outputs_dir / f"{src.name}.zip"
-                print(f"[OutputManager] Packaging folder into zip: {zip_path}...")
-                shutil.make_archive(str(zip_path.with_suffix("")), "zip", str(src))
+            if src.is_dir() or zip_output:
+                zip_path = self.paths.runtime_outputs_dir / f"{target_name}.zip"
+                print(f"[OutputManager] Packaging into zip archive for download: {zip_path}...")
+                if src.is_dir():
+                    shutil.make_archive(str(zip_path.with_suffix("")), "zip", str(src))
+                else:
+                    with zipfile.ZipFile(str(zip_path), "w", zipfile.ZIP_DEFLATED) as zf:
+                        zf.write(str(src), arcname=src.name)
                 download_target = zip_path
 
             try:
@@ -723,24 +880,45 @@ class OutputManager:
                 result.update({
                     "success": False,
                     "exported_path": str(download_target),
-                    "message": f"Colab files.download not available ({e}). Artifact at: {download_target}",
+                    "message": f"Colab files.download unavailable ({e}). Artifact at: {download_target}",
                 })
+            self._handle_cleanup(src, download_target, cleanup_source)
             return result
 
-        # 5. Custom Path export
+        # 6. Custom Path export
         if mode == OutputMode.CUSTOM_PATH:
             dest_dir = Path(destination or "/content/outputs").resolve()
             dest_dir.mkdir(parents=True, exist_ok=True)
-            target = dest_dir / src.name
+            target = dest_dir / target_name
             if src.is_dir():
                 shutil.copytree(str(src), str(target), dirs_exist_ok=True)
-            else:
+            elif src != target:
                 shutil.copy2(str(src), str(target))
+
             result.update({
                 "success": True,
                 "exported_path": str(target),
                 "message": f"Exported to custom path: {target}",
             })
+            self._handle_cleanup(src, target, cleanup_source)
             return result
 
         return result
+
+    @staticmethod
+    def _handle_cleanup(source: Path, target: Optional[Path], cleanup_source: bool) -> None:
+        """Removes the source file if cleanup_source is requested and source differs from target."""
+        if not cleanup_source:
+            return
+        if target is not None and source.resolve() == target.resolve():
+            return
+
+        try:
+            if source.is_file():
+                print(f"[OutputManager] Cleaning up intermediate source file {source.name}...")
+                source.unlink()
+            elif source.is_dir():
+                print(f"[OutputManager] Cleaning up intermediate source directory {source.name}...")
+                shutil.rmtree(str(source))
+        except Exception as e:
+            print(f"[OutputManager] Note during source cleanup: {e}")

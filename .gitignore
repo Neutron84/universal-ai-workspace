@@ -16,7 +16,6 @@ lib/
 lib64/
 parts/
 sdist/
-var/
 wheels/
 *.egg-info/
 .installed.cfg
@@ -28,10 +27,13 @@ env/
 venv/
 cache/uv_cache/
 cache/bin/
+.pytest_cache/
 
 # Ephemeral runtime directories
 runtime/
 /content/runtime/
+outputs/
+inputs/
 
 # Model weights and archives (keep repo lightweight!)
 models/
@@ -42,8 +44,11 @@ models/
 *.pth
 *.onnx
 *.tar.gz
+*.tar.xz
+*.tar.bz2
 *.zip
 *.aria2
+*.imatrix.dat
 
 # Machine-specific state and registry cache
 configs/registry.json

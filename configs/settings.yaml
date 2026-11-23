@@ -1,5 +1,5 @@
 active_profile: core
-auto_sync_to_drive: true
+auto_sync_to_drive: false
 default_backend: llama.cpp
 drive_low_space_warning_gb: 5.0
 drive_root: /content/drive/MyDrive/AI_Workspace
@@ -10,4 +10,5 @@ port: 8000
 runtime_root: /content/runtime
 ssd_low_space_warning_gb: 10.0
 tunnel_type: cloudflared
+workspace_mode: local_ssd
 workspace_name: Universal AI Workspace

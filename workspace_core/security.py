@@ -1,7 +1,7 @@
 """
 Security & Secrets Manager
 Safely retrieves secrets from Google Colab userdata or environment variables.
-Provides secure random API key generation and token masking.
+Provides secure random API key generation, rotation, and token masking.
 """
 
 import os
@@ -18,37 +18,45 @@ class SecurityManager:
     def get_secret(cls, key_name: str, default: Optional[str] = None) -> Optional[str]:
         """
         Retrieves secret prioritizing:
-        1. Google Colab userdata (google.colab.userdata.get)
+        1. In-memory cache (set explicitly in session/UI)
         2. OS Environment Variables (os.environ.get)
-        3. In-memory cache
+        3. Google Colab userdata (google.colab.userdata.get)
         4. Default value
         """
-        if key_name in cls._cached_keys:
+        if key_name in cls._cached_keys and cls._cached_keys[key_name]:
             return cls._cached_keys[key_name]
 
-        # 1. Colab Secrets
+        env_val = os.environ.get(key_name)
+        if env_val and env_val.strip():
+            cls._cached_keys[key_name] = env_val.strip()
+            return cls._cached_keys[key_name]
+
         try:
-            from google.colab import userdata
+            from google.colab import userdata  # type: ignore
             val = userdata.get(key_name)
-            if val:
+            if val and str(val).strip():
                 cls._cached_keys[key_name] = str(val).strip()
                 return cls._cached_keys[key_name]
         except Exception:
             pass
 
-        # 2. Environment Variable
-        env_val = os.environ.get(key_name)
-        if env_val:
-            cls._cached_keys[key_name] = env_val.strip()
-            return cls._cached_keys[key_name]
-
         return default
 
     @classmethod
     def set_cached_secret(cls, key_name: str, value: str) -> None:
-        """Sets an in-memory secret override."""
-        cls._cached_keys[key_name] = value.strip()
-        os.environ[key_name] = value.strip()
+        """Sets an in-memory secret override and exports it to os.environ."""
+        clean = value.strip()
+        if clean:
+            cls._cached_keys[key_name] = clean
+            os.environ[key_name] = clean
+        else:
+            cls.clear_cached_secret(key_name)
+
+    @classmethod
+    def clear_cached_secret(cls, key_name: str) -> None:
+        """Clears an in-memory cached secret."""
+        cls._cached_keys.pop(key_name, None)
+        os.environ.pop(key_name, None)
 
     @classmethod
     def get_hf_token(cls) -> Optional[str]:
@@ -91,9 +99,28 @@ class SecurityManager:
             cls.set_cached_secret("WORKSPACE_API_KEY", key)
         return key
 
+    @classmethod
+    def rotate_workspace_api_key(cls) -> str:
+        """Generates and caches a brand-new workspace server API key."""
+        key = cls.generate_api_key()
+        cls.set_cached_secret("WORKSPACE_API_KEY", key)
+        return key
+
+    @classmethod
+    def list_secrets_status(cls) -> Dict[str, str]:
+        """Returns masked availability status of all supported secrets."""
+        keys = [
+            "HF_TOKEN",
+            "CIVITAI_API_KEY",
+            "CF_TUNNEL_TOKEN",
+            "NGROK_AUTHTOKEN",
+            "WORKSPACE_API_KEY",
+        ]
+        return {k: cls.mask_token(cls.get_secret(k)) for k in keys}
+
     @staticmethod
     def mask_token(token: Optional[str]) -> str:
-        """Masks a token for safe UI display (e.g. 'sk-aiws...xyz')."""
+        """Masks a token for safe UI display (e.g. 'sk-a...xyz')."""
         if not token:
             return "Not Set"
         if len(token) <= 8:

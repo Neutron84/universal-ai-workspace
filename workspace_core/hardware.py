@@ -1,7 +1,7 @@
 """
 Hardware Profiler & Dynamic Environment Diagnostics
 Detects GPU, Compute Capability, VRAM, exact CUDA version, CPU, RAM, and Disk space.
-Configures dynamic NVIDIA shared library paths safely.
+Provides exact architecture-aware KV cache estimation and NVIDIA library setup.
 """
 
 import os
@@ -44,6 +44,8 @@ class GPUInfo:
     supports_flash_attn: bool = False
     supports_kv_quant: bool = False
     supports_vllm: bool = False
+    supports_bf16: bool = False
+    supports_fp8: bool = False
 
 
 @dataclass
@@ -70,11 +72,20 @@ class HardwareProfile:
     drive_used_gb: float = 0.0
     nvidia_lib_paths: List[str] = field(default_factory=list)
 
+    @property
+    def total_vram_mb(self) -> float:
+        return sum(g.total_vram_mb for g in self.gpus)
+
+    @property
+    def total_free_vram_mb(self) -> float:
+        return sum(g.free_vram_mb for g in self.gpus)
+
     def summary(self) -> Dict[str, Any]:
         gpu_summary = "None (CPU/TPU fallback)"
         if self.primary_gpu:
             g = self.primary_gpu
-            gpu_summary = f"{g.name} ({g.sm_name}, {g.free_vram_mb:.0f}MB / {g.total_vram_mb:.0f}MB free)"
+            multi = f" x{len(self.gpus)}" if len(self.gpus) > 1 else ""
+            gpu_summary = f"{g.name}{multi} ({g.sm_name}, {self.total_free_vram_mb:.0f}MB / {self.total_vram_mb:.0f}MB free)"
 
         return {
             "GPU": gpu_summary,
@@ -87,6 +98,8 @@ class HardwareProfile:
             "Drive Storage": f"{self.drive_free_gb:.1f}GB free / {self.drive_total_gb:.1f}GB total",
             "Flash Attention": self.primary_gpu.supports_flash_attn if self.primary_gpu else False,
             "KV Quantization": self.primary_gpu.supports_kv_quant if self.primary_gpu else False,
+            "BF16 Supported": self.primary_gpu.supports_bf16 if self.primary_gpu else False,
+            "FP8 Supported": self.primary_gpu.supports_fp8 if self.primary_gpu else False,
             "vLLM Supported": self.primary_gpu.supports_vllm if self.primary_gpu else False,
         }
 
@@ -126,7 +139,6 @@ class HardwareProfiler:
             "/opt/bin/.nvidia",
         ]
 
-        # NEVER include Google Drive paths in ld.so.conf or system library search
         valid_paths = [
             p for p in candidate_paths
             if Path(p).is_dir() and not str(p).startswith("/content/drive")
@@ -139,10 +151,8 @@ class HardwareProfiler:
             if p not in new_parts:
                 new_parts.append(p)
 
-        new_ld = ":".join(new_parts)
-        os.environ["LD_LIBRARY_PATH"] = new_ld
+        os.environ["LD_LIBRARY_PATH"] = ":".join(new_parts)
 
-        # Attempt to run ldconfig at most once per process
         if not _NVIDIA_CONFIGURED or force:
             try:
                 if shutil.which("ldconfig") and os.geteuid() == 0:
@@ -162,7 +172,6 @@ class HardwareProfiler:
         Detects exact CUDA version supporting both CUDA 12.x and CUDA 13.x.
         Returns: (version_str, major, minor)
         """
-        # Method 1: Check torch
         if HAS_TORCH and torch.cuda.is_available() and torch.version.cuda:
             v_str = torch.version.cuda
             parts = v_str.split(".")
@@ -173,7 +182,6 @@ class HardwareProfiler:
             except (ValueError, IndexError):
                 pass
 
-        # Method 2: Check nvcc command
         try:
             nvcc_res = subprocess.run(["nvcc", "--version"], capture_output=True, text=True, check=False)
             if nvcc_res.returncode == 0:
@@ -185,7 +193,6 @@ class HardwareProfiler:
         except Exception:
             pass
 
-        # Method 3: Check nvidia-smi
         try:
             smi_res = subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=False)
             if smi_res.returncode == 0:
@@ -197,7 +204,6 @@ class HardwareProfiler:
         except Exception:
             pass
 
-        # Method 4: Check /usr/local/cuda version files or directories
         cuda_paths = list(Path("/usr/local").glob("cuda-*.*"))
         if cuda_paths:
             latest = sorted(cuda_paths)[-1].name
@@ -210,13 +216,25 @@ class HardwareProfiler:
         return "N/A", None, None
 
     @staticmethod
-    def detect_gpus() -> List[GPUInfo]:
-        """
-        Detects all GPUs with compute capability, memory, temperature, and utilization.
-        """
+    def _build_gpu_flags(major: int, minor: int, total_mb: float) -> Dict[str, bool]:
+        supports_flash_attn = (major > 7) or (major == 7 and minor >= 5)
+        supports_kv_quant = (major > 7) or (major == 7 and minor >= 5)
+        supports_vllm = supports_flash_attn and (total_mb >= 12000)
+        supports_bf16 = major >= 8
+        supports_fp8 = (major > 8) or (major == 8 and minor >= 9)
+        return {
+            "supports_flash_attn": supports_flash_attn,
+            "supports_kv_quant": supports_kv_quant,
+            "supports_vllm": supports_vllm,
+            "supports_bf16": supports_bf16,
+            "supports_fp8": supports_fp8,
+        }
+
+    @classmethod
+    def detect_gpus(cls) -> List[GPUInfo]:
+        """Detects all GPUs with compute capability, memory, temperature, and utilization."""
         gpus: List[GPUInfo] = []
 
-        # Try pynvml first
         if HAS_PYNVML:
             try:
                 pynvml.nvmlInit()
@@ -238,7 +256,6 @@ class HardwareProfiler:
 
                     sm_name = f"sm_{major}{minor}"
 
-                    # Temperature & utilization
                     try:
                         temp = float(pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU))
                     except Exception:
@@ -249,11 +266,7 @@ class HardwareProfiler:
                     except Exception:
                         util = None
 
-                    # Features
-                    supports_flash_attn = (major > 7) or (major == 7 and minor >= 5)  # Turing sm_75 and above
-                    supports_kv_quant = (major > 7) or (major == 7 and minor >= 5)
-                    supports_vllm = ((major > 7) or (major == 7 and minor >= 5)) and (total_mb >= 12000)
-
+                    flags = cls._build_gpu_flags(major, minor, total_mb)
                     gpus.append(
                         GPUInfo(
                             index=idx,
@@ -265,16 +278,13 @@ class HardwareProfiler:
                             used_vram_mb=used_mb,
                             temperature_c=temp,
                             utilization_pct=util,
-                            supports_flash_attn=supports_flash_attn,
-                            supports_kv_quant=supports_kv_quant,
-                            supports_vllm=supports_vllm,
+                            **flags,
                         )
                     )
                 return gpus
-            except Exception as e:
+            except Exception:
                 pass
 
-        # Fallback to PyTorch
         if HAS_TORCH and torch.cuda.is_available():
             for idx in range(torch.cuda.device_count()):
                 name = torch.cuda.get_device_name(idx)
@@ -286,10 +296,7 @@ class HardwareProfiler:
                 free_mb = free_bytes / (1024 * 1024)
                 used_mb = total_mb - free_mb
 
-                supports_flash_attn = (major > 7) or (major == 7 and minor >= 5)
-                supports_kv_quant = (major > 7) or (major == 7 and minor >= 5)
-                supports_vllm = ((major > 7) or (major == 7 and minor >= 5)) and (total_mb >= 12000)
-
+                flags = cls._build_gpu_flags(major, minor, total_mb)
                 gpus.append(
                     GPUInfo(
                         index=idx,
@@ -299,11 +306,85 @@ class HardwareProfiler:
                         total_vram_mb=total_mb,
                         free_vram_mb=free_mb,
                         used_vram_mb=used_mb,
-                        supports_flash_attn=supports_flash_attn,
-                        supports_kv_quant=supports_kv_quant,
-                        supports_vllm=supports_vllm,
+                        **flags,
                     )
                 )
+            return gpus
+
+        # Fallback: parse nvidia-smi when neither pynvml nor torch is present
+        if shutil.which("nvidia-smi"):
+            try:
+                res = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=index,name,memory.total,memory.free,memory.used,temperature.gpu,utilization.gpu,compute_cap",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if res.returncode != 0 or not res.stdout.strip():
+                    res = subprocess.run(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=index,name,memory.total,memory.free,memory.used,temperature.gpu,utilization.gpu",
+                            "--format=csv,noheader,nounits",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                if res.returncode == 0 and res.stdout.strip():
+                    for line in res.stdout.strip().splitlines():
+                        parts = [p.strip() for p in line.split(",")]
+                        if len(parts) < 5:
+                            continue
+                        idx = int(parts[0])
+                        name = parts[1]
+                        total_mb = float(parts[2])
+                        free_mb = float(parts[3])
+                        used_mb = float(parts[4])
+                        temp = float(parts[5]) if len(parts) > 5 and parts[5].replace(".", "", 1).isdigit() else None
+                        util = float(parts[6]) if len(parts) > 6 and parts[6].replace(".", "", 1).isdigit() else None
+                        cc_str = parts[7] if len(parts) > 7 else ""
+                        if "." in cc_str:
+                            try:
+                                c_parts = cc_str.split(".")
+                                major, minor = int(c_parts[0]), int(c_parts[1])
+                            except ValueError:
+                                major, minor = (7, 5)
+                        else:
+                            upper_name = name.upper()
+                            if "H100" in upper_name or "H200" in upper_name:
+                                major, minor = (9, 0)
+                            elif "L4" in upper_name or "RTX 40" in upper_name or "ADA" in upper_name:
+                                major, minor = (8, 9)
+                            elif "A100" in upper_name or "A10" in upper_name or "RTX 30" in upper_name:
+                                major, minor = (8, 0)
+                            elif "V100" in upper_name:
+                                major, minor = (7, 0)
+                            elif any(p in upper_name for p in ("GTX 10", "P100", "P40", "P4")):
+                                major, minor = (6, 1)
+                            else:
+                                major, minor = (7, 5)
+                        flags = cls._build_gpu_flags(major, minor, total_mb)
+                        gpus.append(
+                            GPUInfo(
+                                index=idx,
+                                name=name,
+                                compute_capability=(major, minor),
+                                sm_name=f"sm_{major}{minor}",
+                                total_vram_mb=total_mb,
+                                free_vram_mb=free_mb,
+                                used_vram_mb=used_mb,
+                                temperature_c=temp,
+                                utilization_pct=util,
+                                **flags,
+                            )
+                        )
+            except Exception:
+                pass
 
         return gpus
 
@@ -324,22 +405,31 @@ class HardwareProfiler:
                     driver_ver = driver_ver.decode("utf-8")
             except Exception:
                 pass
+        elif shutil.which("nvidia-smi"):
+            try:
+                smi = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if smi.returncode == 0 and smi.stdout.strip():
+                    driver_ver = smi.stdout.strip().splitlines()[0].strip()
+            except Exception:
+                pass
 
-        # System RAM
         vm = psutil.virtual_memory()
         ram_total = vm.total / (1024**3)
         ram_avail = vm.available / (1024**3)
         ram_used = vm.used / (1024**3)
         ram_pct = vm.percent
 
-        # SSD Space
         ssd_target = ssd_path if Path(ssd_path).is_dir() else "/"
         ssd_usage = shutil.disk_usage(ssd_target)
         ssd_total = ssd_usage.total / (1024**3)
         ssd_free = ssd_usage.free / (1024**3)
         ssd_used = ssd_usage.used / (1024**3)
 
-        # Drive Space
         drive_target = drive_path if Path(drive_path).is_dir() else ssd_target
         try:
             drive_usage = shutil.disk_usage(drive_target)
@@ -372,29 +462,90 @@ class HardwareProfiler:
         )
 
     @staticmethod
+    def calculate_kv_cache_mb(
+        ctx_size: int = 4096,
+        kv_cache_quant: str = "q8_0",
+        config_json: Optional[Dict[str, Any]] = None,
+        estimated_params_b: Optional[float] = None,
+        parallel: int = 1,
+    ) -> float:
+        """
+        Estimates KV cache VRAM requirement in MB.
+        Uses exact transformer dimensions from config.json when available,
+        scaling cleanly with GQA (num_key_value_heads) and parallel slots.
+        """
+        bytes_per_elem = {
+            "f32": 4.0,
+            "fp32": 4.0,
+            "f16": 2.0,
+            "fp16": 2.0,
+            "bf16": 2.0,
+            "q8_0": 1.06,
+            "q4_0": 0.56,
+            "q4_1": 0.62,
+        }.get((kv_cache_quant or "q8_0").lower(), 1.06)
+
+        slots = max(1, int(parallel or 1))
+        cfg = config_json or {}
+
+        # Exact calculation if model architecture dimensions are present
+        n_layers = cfg.get("num_hidden_layers") or cfg.get("n_layer")
+        n_heads = cfg.get("num_attention_heads") or cfg.get("n_head")
+        hidden_size = cfg.get("hidden_size") or cfg.get("n_embd")
+        n_kv_heads = cfg.get("num_key_value_heads") or n_heads
+        head_dim = cfg.get("head_dim")
+
+        if n_layers and n_kv_heads and (head_dim or (hidden_size and n_heads)):
+            try:
+                h_dim = int(head_dim) if head_dim else (int(hidden_size) // int(n_heads))
+                kv_bytes = 2.0 * int(n_layers) * int(n_kv_heads) * h_dim * int(ctx_size) * slots * bytes_per_elem
+                return max(16.0, kv_bytes / (1024 * 1024))
+            except Exception:
+                pass
+
+        # Fallback heuristic scaled by estimated parameter count
+        base_rate_per_k = {
+            "f32": 1000.0,
+            "fp32": 1000.0,
+            "f16": 500.0,
+            "fp16": 500.0,
+            "bf16": 500.0,
+            "q8_0": 256.0,
+            "q4_0": 130.0,
+        }.get((kv_cache_quant or "q8_0").lower(), 256.0)
+
+        scale = 1.0
+        if estimated_params_b and estimated_params_b > 0:
+            # 7B-8B GQA models serve as ~1.0x reference; 0.5B uses ~0.15x; 32B uses ~2.0x
+            scale = max(0.15, min(3.5, (estimated_params_b / 7.0) ** 0.7))
+
+        return (ctx_size / 1024.0) * base_rate_per_k * scale * slots
+
+    @classmethod
     def calculate_vram_budget_mb(
+        cls,
         free_vram_mb: float,
         cuda_overhead_mb: float = 1200.0,
         ctx_size: int = 4096,
-        kv_cache_quant: str = "q8_0"
+        kv_cache_quant: str = "q8_0",
+        config_json: Optional[Dict[str, Any]] = None,
+        estimated_params_b: Optional[float] = None,
+        parallel: int = 1,
+        safety_margin_pct: float = 0.0,
     ) -> float:
         """
         Calculates safe usable VRAM budget for model weights:
-        Usable = Free_VRAM - CUDA_Runtime_Overhead - Estimated_KV_Cache
+        Usable = Free_VRAM * (1 - safety_margin_pct) - CUDA_Runtime_Overhead - Estimated_KV_Cache
         """
-        # KV cache size estimate: 2 * n_layers * n_heads * head_dim * ctx * bytes_per_elem
-        # Approximation for typical 7B-14B models:
-        # fp16 (16-bit): ~0.5MB per token context -> ~2048MB for 4k context
-        # q8_0 (8-bit): ~0.25MB per token context -> ~1024MB for 4k context
-        # q4_0 (4-bit): ~0.13MB per token context -> ~512MB for 4k context
-        kv_rate_per_k_ctx = {
-            "fp16": 500.0,
-            "q8_0": 256.0,
-            "q4_0": 130.0,
-        }.get(kv_cache_quant.lower(), 256.0)
-
-        estimated_kv_mb = (ctx_size / 1024.0) * kv_rate_per_k_ctx
-        usable = free_vram_mb - cuda_overhead_mb - estimated_kv_mb
+        estimated_kv_mb = cls.calculate_kv_cache_mb(
+            ctx_size=ctx_size,
+            kv_cache_quant=kv_cache_quant,
+            config_json=config_json,
+            estimated_params_b=estimated_params_b,
+            parallel=parallel,
+        )
+        effective_free = free_vram_mb * max(0.5, 1.0 - max(0.0, safety_margin_pct))
+        usable = effective_free - cuda_overhead_mb - estimated_kv_mb
         return max(0.0, usable)
 
 

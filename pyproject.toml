@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "universal-ai-workspace"
-version = "1.1.0"
-description = "Modular multi-backend machine learning workspace for Google Colab and Linux workstations"
+version = "1.2.0"
+description = "Modular multi-backend machine learning workspace with Auto & Manual controls for Google Colab and Linux"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -68,10 +68,12 @@ diffusion = [
     "transformers>=4.40.0",
     "accelerate>=0.30.0",
     "safetensors>=0.4.0",
+    "pillow>=10.0.0",
 ]
 audio = [
     "faster-whisper>=1.0.0",
     "soundfile>=0.12.0",
+    "ctranslate2>=4.0.0",
 ]
 unsloth = [
     "unsloth",
@@ -93,6 +95,7 @@ autoawq = [
 ]
 exllamav2 = [
     "exllamav2",
+    "torch",
 ]
 ct2 = [
     "ctranslate2",
@@ -101,6 +104,9 @@ ct2 = [
 all = [
     "universal-ai-workspace[core,transformers,diffusion,audio]",
 ]
+
+[project.scripts]
+ai-workspace = "workspace_core.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

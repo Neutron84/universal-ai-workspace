@@ -2,6 +2,8 @@
 Unit tests for ModelInspector and AutoSelector capability-driven routing.
 """
 
+import shutil
+import tempfile
 import unittest
 from pathlib import Path
 from workspace_core.hardware import HardwareProfile, GPUInfo
@@ -11,7 +13,6 @@ from workspace_core.auto_selector import AutoSelector
 
 class TestModelInspectorAndAutoSelector(unittest.TestCase):
     def setUp(self):
-        # Mock modern GPU (e.g. L4, compute capability 8.9, 24GB VRAM)
         self.modern_gpu = GPUInfo(
             index=0,
             name="NVIDIA L4",
@@ -22,7 +23,9 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
             used_vram_mb=2000.0,
             supports_flash_attn=True,
             supports_kv_quant=True,
-            supports_vllm=True
+            supports_vllm=True,
+            supports_bf16=True,
+            supports_fp8=True,
         )
         self.modern_hw = HardwareProfile(
             has_gpu=True,
@@ -39,10 +42,9 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
             cuda_major=12,
             driver_version="535.104.05",
             python_version="3.10.12",
-            python_executable="/usr/bin/python3"
+            python_executable="/usr/bin/python3",
         )
 
-        # Mock standard T4 GPU (compute capability 7.5, 15GB VRAM)
         self.t4_gpu = GPUInfo(
             index=0,
             name="Tesla T4",
@@ -53,7 +55,7 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
             used_vram_mb=1109.0,
             supports_flash_attn=True,
             supports_kv_quant=True,
-            supports_vllm=False
+            supports_vllm=False,
         )
         self.t4_hw = HardwareProfile(
             has_gpu=True,
@@ -70,7 +72,7 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
             cuda_major=12,
             driver_version="535.104.05",
             python_version="3.10.12",
-            python_executable="/usr/bin/python3"
+            python_executable="/usr/bin/python3",
         )
 
     def test_standard_gguf_selects_llama_cpp(self):
@@ -89,9 +91,9 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
                     shard_files=["qwen2.5-0.5b-instruct-q4_k_m.gguf"],
                     total_size_bytes=350 * 1024 * 1024,
                     total_size_gb=0.35,
-                    is_ik_quant=False
+                    is_ik_quant=False,
                 )
-            ]
+            ],
         )
         selector = AutoSelector(hardware=self.t4_hw)
         rec = selector.recommend(insp)
@@ -103,7 +105,6 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
 
     def test_ik_quant_or_moe_selects_ik_llama(self):
         """Non-uniform IQ quants (e.g. IQ4_KS) or oversized MoE models should select ik_llama."""
-        # Case A: Explicit IQ4_KS non-uniform quant
         insp_ik = InspectionResult(
             source_type="local",
             raw_source="/content/model-IQ4_KS.gguf",
@@ -119,16 +120,15 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
                     shard_files=["model-IQ4_KS.gguf"],
                     total_size_bytes=4 * 1024 * 1024 * 1024,
                     total_size_gb=4.0,
-                    is_ik_quant=True
+                    is_ik_quant=True,
                 )
-            ]
+            ],
         )
         selector_t4 = AutoSelector(hardware=self.t4_hw)
         rec_ik = selector_t4.recommend(insp_ik)
         self.assertEqual(rec_ik.recommended_engine, "ik_llama")
         self.assertEqual(rec_ik.recommended_converter, "ik_llama")
 
-        # Case B: MoE model exceeding VRAM budget
         insp_moe = InspectionResult(
             source_type="hf_repo",
             raw_source="mistralai/Mixtral-8x7B-Instruct-v0.1-GGUF",
@@ -143,15 +143,15 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
                     quant="Q4_K_M",
                     is_split=False,
                     shard_files=["mixtral-8x7b-q4_k_m.gguf"],
-                    total_size_bytes=26 * 1024 * 1024 * 1024,  # 26 GB exceeds 14GB T4 budget
+                    total_size_bytes=26 * 1024 * 1024 * 1024,
                     total_size_gb=26.0,
-                    is_ik_quant=False
+                    is_ik_quant=False,
                 )
-            ]
+            ],
         )
         rec_moe = selector_t4.recommend(insp_moe)
         self.assertEqual(rec_moe.recommended_engine, "ik_llama")
-        self.assertIn("ik_llama", rec_moe.decision_summary)
+        self.assertIn("override_tensor", rec_moe.suggested_extra_args)
 
     def test_lora_or_unsloth_selects_unsloth(self):
         """LoRA adapter repo or Unsloth repo should select unsloth engine and converter."""
@@ -161,7 +161,7 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
             model_id="llama3-lora-adapter",
             model_type="llm-safetensors",
             is_lora=True,
-            quant_format="unquantized_fp16"
+            quant_format="unquantized_fp16",
         )
         selector = AutoSelector(hardware=self.t4_hw)
         rec_lora = selector.recommend(insp_lora)
@@ -175,16 +175,14 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
             raw_source="TheBloke/Llama-2-7B-AWQ",
             model_id="Llama-2-7B-AWQ",
             model_type="llm-safetensors",
-            quant_format="awq"
+            quant_format="awq",
         )
 
-        # On Modern L4 GPU:
         selector_l4 = AutoSelector(hardware=self.modern_hw)
         rec_l4 = selector_l4.recommend(insp_awq)
         self.assertEqual(rec_l4.recommended_engine, "vllm")
         self.assertEqual(rec_l4.recommended_converter, "autoawq")
 
-        # On Legacy T4 GPU:
         selector_t4 = AutoSelector(hardware=self.t4_hw)
         rec_t4 = selector_t4.recommend(insp_awq)
         self.assertEqual(rec_t4.recommended_engine, "transformers")
@@ -197,7 +195,7 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
             raw_source="turboderp/Llama2-7B-exl2",
             model_id="Llama2-7B-exl2",
             model_type="llm-safetensors",
-            quant_format="exl2"
+            quant_format="exl2",
         )
         selector = AutoSelector(hardware=self.t4_hw)
         rec = selector.recommend(insp_exl2)
@@ -210,7 +208,7 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
             source_type="hf_repo",
             raw_source="openai/whisper-large-v3",
             model_id="whisper-large-v3",
-            model_type="audio"
+            model_type="audio",
         )
         selector = AutoSelector(hardware=self.t4_hw)
         rec = selector.recommend(insp_audio)
@@ -233,9 +231,9 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
                     shard_files=["qwen2.5-0.5b-instruct-q4_k_m.gguf"],
                     total_size_bytes=350 * 1024 * 1024,
                     total_size_gb=0.35,
-                    is_ik_quant=False
+                    is_ik_quant=False,
                 )
-            ]
+            ],
         )
         selector = AutoSelector(hardware=self.t4_hw)
         rec = selector.recommend(
@@ -247,7 +245,7 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
             override_n_gpu_layers=20,
             override_flash_attn=False,
             override_cache_type_k="q4_0",
-            override_cache_type_v="q4_0"
+            override_cache_type_v="q4_0",
         )
 
         self.assertEqual(rec.recommended_engine, "ik_llama")
@@ -275,18 +273,87 @@ class TestModelInspectorAndAutoSelector(unittest.TestCase):
                     shard_files=["model-q8_0.gguf"],
                     total_size_bytes=8 * 1024 * 1024 * 1024,
                     total_size_gb=8.0,
-                    is_ik_quant=False
+                    is_ik_quant=False,
                 )
-            ]
+            ],
         )
         selector = AutoSelector(hardware=self.t4_hw)
-        rec = selector.recommend(
-            inspection=insp,
-            override_quant="Q4_K_M"
-        )
+        rec = selector.recommend(inspection=insp, override_quant="Q4_K_M")
         self.assertTrue(rec.needs_requant)
         self.assertEqual(rec.requant_target_quant, "Q4_K_M")
         self.assertEqual(rec.recommended_quant, "Q4_K_M")
+
+    def test_vllm_repo_name_does_not_false_trigger_vlm(self):
+        """Repo names containing 'vllm' must NOT be misclassified as Vision-Language (VLM)."""
+        mtype, backend = ModelInspector._classify_architecture(
+            repo_id="org/llama-3-8b-vllm-fp8",
+            pipeline_tag="text-generation",
+            tags=[],
+            has_gguf=False,
+            has_safetensors=True,
+            has_mmproj=False,
+            file_names=["model.safetensors", "config.json"],
+        )
+        self.assertEqual(mtype, "llm-safetensors")
+        self.assertEqual(backend, "vllm")
+
+    def test_convert_and_serve_safetensors_on_llama_cpp(self):
+        """Safetensors targeted for llama.cpp or convert_and_serve should set needs_convert_to_gguf=True."""
+        insp = InspectionResult(
+            source_type="hf_repo",
+            raw_source="Qwen/Qwen2.5-3B-Instruct",
+            model_id="Qwen2.5-3B-Instruct",
+            model_type="llm-safetensors",
+            quant_format="unquantized_fp16",
+            total_repo_size_bytes=6 * 1024 * 1024 * 1024,
+        )
+        selector = AutoSelector(hardware=self.t4_hw)
+        rec = selector.recommend(insp, task="convert_and_serve", override_engine="llama.cpp")
+        self.assertTrue(rec.needs_convert_to_gguf)
+        self.assertEqual(rec.recommended_engine, "llama.cpp")
+        self.assertEqual(rec.recommended_converter, "llama.cpp")
+
+    def test_local_split_gguf_and_sibling_mmproj_discovery(self):
+        """Inspecting shard 1 of a split local GGUF should auto-discover all shards and sibling mmproj."""
+        tmp = Path(tempfile.mkdtemp(prefix="test_split_"))
+        try:
+            s1 = tmp / "VLM-Q4_K_M-00001-of-00002.gguf"
+            s2 = tmp / "VLM-Q4_K_M-00002-of-00002.gguf"
+            mm = tmp / "mmproj-model-f16.gguf"
+            s1.write_bytes(b"shard1")
+            s2.write_bytes(b"shard2")
+            mm.write_bytes(b"mmproj")
+
+            insp = ModelInspector().inspect(str(s1), input_mode="local_path")
+            self.assertEqual(insp.model_type, "vlm-gguf")
+            self.assertTrue(insp.is_vlm)
+            self.assertEqual(len(insp.gguf_variants), 1)
+            self.assertTrue(insp.gguf_variants[0].is_split)
+            self.assertEqual(len(insp.gguf_variants[0].shard_files), 2)
+            self.assertIsNotNone(insp.gguf_variants[0].mmproj_file)
+        finally:
+            shutil.rmtree(str(tmp))
+
+    def test_strategies_and_auto_context(self):
+        """AutoSelector should support 'auto' context and distinct strategies."""
+        insp = InspectionResult(
+            source_type="hf_repo",
+            raw_source="test/model-gguf",
+            model_id="model-gguf",
+            model_type="llm-gguf",
+            quant_format="gguf_standard",
+            max_context_length=16384,
+            gguf_variants=[
+                GGUFVariant("m-Q8_0", "Q8_0", False, ["m-Q8_0.gguf"], 8 * 1024**3, 8.0),
+                GGUFVariant("m-Q4_K_M", "Q4_K_M", False, ["m-Q4_K_M.gguf"], 4 * 1024**3, 4.0),
+            ],
+        )
+        selector = AutoSelector(hardware=self.modern_hw)
+        rec_speed = selector.recommend(insp, requested_ctx="auto", strategy="max_speed")
+        rec_ctx = selector.recommend(insp, requested_ctx="auto", strategy="max_context")
+        self.assertEqual(rec_speed.recommended_quant, "Q4_K_M")
+        self.assertEqual(rec_ctx.recommended_ctx, 16384)
+        self.assertEqual(rec_ctx.cache_type_k, "q4_0")
 
 
 if __name__ == "__main__":

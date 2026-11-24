@@ -4,16 +4,35 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-Universal AI Workspace provides a modular environment for running, converting, and quantizing machine learning models on Google Colab, cloud GPUs, and Linux workstations. It integrates native CUDA execution backends, dynamic hardware budget allocation, and decoupled storage modes without mandatory cloud drive dependencies.
+Universal AI Workspace provides a modular environment for running, converting, quantizing, and benchmarking machine learning models on Google Colab, cloud GPUs, and Linux workstations. Every layer supports both capability-driven `auto` routing and granular manual overrides via the Colab notebook, the 8-tab Gradio dashboard, or the CLI.
 
 ---
 
 ## Setup and Quickstart
 
+### Google Colab
 1. Open `Workspace_Launcher.ipynb` in Google Colab.
-2. In Cell 1 (`Setup Configuration`), choose your desired code source, storage mode, input model, engine, and output destination.
-3. Select **Runtime > Run All** (`Ctrl + F9`) or run the individual cells in sequence.
-4. If `task="serve"` was selected, use the generated client snippet or public Cloudflare tunnel to send OpenAI-compatible API requests.
+2. Leave defaults in Cell 1 (`Setup Configuration`) for automatic hardware/model detection, or expand manual parameters for fine-grained control.
+3. Select **Runtime > Run All** (`Ctrl + F9`) or run individual cells in sequence.
+4. For serving tasks, use the printed client snippet, local endpoint, or public tunnel URL.
+
+### Command-Line Interface (Linux / Local)
+```bash
+# Run pre-flight hardware and binary diagnostics
+python -m workspace_core doctor
+
+# Dry-run inspect and VRAM/engine planning without downloading weights
+python -m workspace_core inspect Qwen/Qwen2.5-0.5B-Instruct-GGUF --strategy balanced
+
+# Serve a model with automatic engine/quant selection
+python -m workspace_core serve Qwen/Qwen2.5-0.5B-Instruct-GGUF --ctx auto --flash-attn true
+
+# Convert and quantize a Safetensors repo with imatrix calibration and 2GB shard splitting
+python -m workspace_core convert Qwen/Qwen2.5-0.5B-Instruct --target-quant Q4_K_M --imatrix --split-max-size 2G
+
+# Launch the 8-tab Gradio management dashboard
+python -m workspace_core dashboard --port 7860
+```
 
 ---
 
@@ -21,16 +40,16 @@ Universal AI Workspace provides a modular environment for running, converting, a
 
 | Engine / Converter | Type | Supported Formats | Hardware Support | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| **llama.cpp** | Engine & Converter | GGUF (`Q4_K_M`, `Q5_K_M`, `Q8_0`, `IQ4_XS`, etc.) | CPU, CUDA (`sm_75` to `sm_90`) | Native inference, Safetensors-to-GGUF conversion, imatrix calibration, and shard splitting. |
-| **ik_llama.cpp** | Engine & Converter | Non-uniform GGUF (`IQ4_K`, `IQ4_KS`, `IQ3_K`, `IQ2_K`, etc.) | CUDA (`sm_75` to `sm_90`) | Optimized non-uniform IQ quants and hybrid MoE CPU/GPU tensor offload (`-ot`). |
-| **unsloth** | Engine & Converter | Dynamic GGUF, 4-bit LoRA Safetensors | CUDA (`sm_75`+) | Fast LoRA adapter merging and Dynamic GGUF export (`q4_k_xl`, `q4_k_m`, `q5_k_m`). |
-| **vllm** | Engine | Safetensors (AWQ, GPTQ, FP8, FP16) | CUDA (`sm_89`+, L4, A100, H100) | High-throughput PagedAttention server for quantized and unquantized Safetensors. |
-| **transformers** | Engine | Safetensors (BitsAndBytes 4-bit, 8-bit, FP16) | CPU, CUDA (T4, L4, A100) | General fallback server for Hugging Face transformer models. |
-| **exllamav2** | Engine & Converter | EXL2 (fractional bpw) | CUDA (`sm_75`+) | Fractional bits-per-weight quantization and low-overhead inference. |
-| **gptqmodel** | Converter | GPTQ (4-bit, 8-bit) | CUDA | Quantizes Safetensors models using the GPTQ algorithm. |
-| **autoawq** | Converter | AWQ (4-bit), FP8 | CUDA (`sm_75` to `sm_90`) | Activation-aware Weight Quantization for vLLM and Transformers. |
-| **faster-whisper / ct2** | Engine & Converter | CTranslate2 | CPU, CUDA | Converts Hugging Face Whisper models and serves transcription endpoints. |
-| **diffusers** | Engine | Safetensors, Checkpoints | CUDA | Stable Diffusion image generation server with `/v1/images/generations` endpoint. |
+| **llama.cpp** | Engine & Converter | GGUF (`Q4_K_M`, `Q5_K_M`, `Q8_0`, `IQ4_XS`, etc.) | CPU, CUDA (`sm_75`+) | Native inference, Safetensors-to-GGUF conversion, `llama-imatrix`, and shard splitting. |
+| **ik_llama.cpp** | Engine & Converter | Non-uniform GGUF (`IQ4_K`, `IQ4_KS`, `IQ3_K`, `IQ2_K`, etc.) | CUDA (`sm_75`+) | Optimized non-uniform IQ quants and hybrid MoE CPU/GPU tensor offload (`-ot`). |
+| **unsloth** | Engine & Converter | Dynamic GGUF, 4-bit LoRA Safetensors | CUDA (`sm_75`+) | LoRA adapter merging, merged Safetensors export, and Dynamic GGUF (`q4_k_xl`, `q4_k_m`). |
+| **vllm** | Engine | Safetensors (AWQ, GPTQ, FP8, FP16) | CUDA (`sm_89`+, L4, A100, H100) | High-throughput PagedAttention server with KV dtype and tensor-parallel controls. |
+| **transformers** | Engine | Safetensors (BnB 4-bit, 8-bit, FP16, BF16, LoRA) | CPU, CUDA | Flexible OpenAI-compatible server with automatic PEFT LoRA adapter loading. |
+| **exllamav2** | Engine & Converter | EXL2 (fractional bpw), GPTQ | CUDA (`sm_75`+) | Fractional bits-per-weight quantization and native ExLlamaV2 streaming server. |
+| **gptqmodel** | Converter | GPTQ (4-bit, 8-bit) | CUDA | Quantizes Safetensors models using GPTQ with configurable group size and desc_act. |
+| **autoawq** | Converter | AWQ (4-bit), FP8 | CUDA (`sm_75`+) | Activation-aware Weight Quantization for vLLM and Transformers. |
+| **faster-whisper / ct2** | Engine & Converter | CTranslate2 | CPU, CUDA | Converts HF Whisper models and serves `/v1/audio/transcriptions` and `/translations`. |
+| **diffusers** | Engine | Safetensors, single-file `.ckpt`/`.safetensors` | CUDA, CPU | Image generation server (`from_pretrained` & `from_single_file`) with LoRA & CPU offload. |
 
 ---
 
@@ -38,77 +57,34 @@ Universal AI Workspace provides a modular environment for running, converting, a
 
 | Mode | Target Location | Google Drive Mount | Description |
 | :--- | :--- | :--- | :--- |
-| `local_ssd` | `/content/ai_workspace` | Not Mounted | Operates entirely on ephemeral local SSD. Recommended for public notebooks. |
-| `hybrid` | `/content/drive/MyDrive/AI_Workspace` | Mounted | Writes runtime cache to local SSD and syncs registered models and configs to Drive. |
-| `google_drive` | Absolute Drive path | Mounted | Keeps models and configuration directly in the specified Google Drive folder. |
-| `gdrive_relative`| Relative to `MyDrive/` | Mounted | Resolves paths relative to Google Drive root directory. |
-| `custom_path` | Custom mount or directory | Optional | Allows arbitrary mount paths (e.g., shared network volumes or external drives). |
+| `local_ssd` | `/content/ai_workspace` | Not Mounted | Ephemeral local SSD storage. Recommended for public shared notebooks. |
+| `hybrid` | `/content/drive/MyDrive/AI_Workspace` | Mounted | Fast SSD runtime cache with Drive model and config sync. |
+| `google_drive` | Absolute Drive path | Mounted | Stores workspace directly in the specified Google Drive folder. |
+| `gdrive_relative` | Relative to `MyDrive/` | Mounted | Resolves workspace path relative to `/content/drive/MyDrive/`. |
+| `custom_path` | Custom mount or directory | Optional | Arbitrary local, network, or container storage path. |
 
 ---
 
-## Input and Output Options
+## Input Sources and Output Sinks
 
 ### Input Sources (`input_type`)
-
-| Input Type | Format / Example | Description |
-| :--- | :--- | :--- |
-| `auto` | URI or repo ID | Automatically identifies source based on URL scheme or syntax. |
-| `huggingface` | `Qwen/Qwen2.5-0.5B-Instruct-GGUF` | Resolves models from Hugging Face Hub. Supports optional `input_file`. |
-| `direct_upload` | Interactive Colab file upload | Uploads file directly into `/content/runtime/inputs/`. |
-| `local_path` | `/content/models/model.gguf` | Loads an existing file or directory from local filesystem. |
-| `google_drive` | `/content/drive/MyDrive/models/model.gguf` | Loads from an absolute Google Drive path. |
-| `gdrive_relative`| `models/model.gguf` or folder name | Copies relative file or folder from `MyDrive/` into local working directory. |
-| `gdrive_share` | `gshare://<id>` or share URL | Downloads public Google Drive shared files or folders using `gdown`. |
-| `url` | Direct HTTP/HTTPS link | Downloads via `aria2c` with parallel segmented connections. |
-| `civitai` | `civitai://<id>` or CivitAI URL | Queries CivitAI API and downloads model checkpoint. |
-| `git_repo` | `https://github.com/org/repo.git` | Shallow clones repository into local runtime. |
+- `auto`: Automatically detects `hf://`, `gdrive://`, `gshare://`, `civitai://`, `git://`, HTTP URLs, local paths, and `org/repo`.
+- `huggingface`, `direct_upload`, `local_path`, `google_drive`, `gdrive_relative`, `gdrive_share`, `url`, `civitai`, `git_repo`.
 
 ### Output Sinks (`output_type`)
-
-| Output Type | Behavior | Description |
-| :--- | :--- | :--- |
-| `none` | Retains artifact at source | No export or copy is performed. |
-| `local_ssd` | Saves to `/content/runtime/outputs/` | Fast local SSD storage. |
-| `direct_download` | Triggers browser download | Auto-downloads through browser via `google.colab.files.download`. |
-| `google_drive` | Staged to local SSD then copied | Backs up artifact to persistent Google Drive path. |
-| `gdrive_relative` | Staged then copied to `MyDrive/` | Copies output relative to `/content/drive/MyDrive/`. |
-| `gdrive_direct` | Direct write to Google Drive | Writes directly to Drive without local copy. Useful when local disk is constrained. |
-| `huggingface_hub` | Uploads via `HfApi` | Publishes converted or quantized model directly to Hugging Face repository. |
-| `custom_path` | Copies to directory | Exports to arbitrary filesystem path. |
+- `none`, `local_ssd`, `direct_download`, `google_drive`, `gdrive_relative`, `gdrive_direct`, `huggingface_hub`, `custom_path`.
 
 ---
 
-## Setup Form Parameters
+## Tasks (`task`)
 
-- `code_source`: Source of workspace code (`github`, `google_drive`, `gdrive_relative`, `url`, `local_dir`).
-- `code_path`: Path or URL for code repository. Default: `https://github.com/Neutron84/universal-ai-workspace.git`.
-- `workspace_mode`: Storage strategy (`local_ssd`, `hybrid`, `google_drive`, `gdrive_relative`, `custom_path`).
-- `workspace_path`: Path relative to `MyDrive` for hybrid/relative modes, or absolute path for custom modes.
-- `input_type`: Source type for the model or archive.
-- `input_path`: Model identifier, repo ID, URL, or filesystem path. Ignored if `input_type` is `direct_upload`.
-- `input_file`: Specific file inside repo or folder. Left blank for automatic selection.
-- `unpack_archive`: Automatically extracts `.zip`, `.tar.gz`, `.tar.xz`, and `.tar.bz2` input archives.
-- `task`: Operation mode (`serve` to host an API server, `convert_and_quantize` to run conversion, or `dashboard_only`).
-- `engine`: Inference engine (`auto`, `llama.cpp`, `ik_llama`, `vllm`, `transformers`, `unsloth`, `exllamav2`, `diffusers`, `faster-whisper`).
-- `quantizer`: Quantization backend (`auto`, `none`, `llama.cpp`, `ik_llama`, `unsloth`, `gptqmodel`, `autoawq`, `exllamav2`, `ct2`).
-- `target_quant`: Desired quantization format (`auto`, `Q4_K_M`, `IQ4_KS`, `Q8_0`, `AWQ`, `GPTQ`, `EXL2`, etc.).
-- `context_size`: Context window size in tokens. Default: `4096`.
-- `n_gpu_layers`: Number of layers to offload to GPU (-1 for all GPU layers, 0 for CPU only, or positive integer for partial offload).
-- `flash_attn`: Enables Flash Attention on supported GPUs (`sm_75+`) for speed and VRAM savings.
-- `cache_type_k` / `cache_type_v`: KV cache quantization format (`auto`, `q8_0`, `q4_0`, `f16`).
-- `custom_server_args`: Optional raw CLI flags passed directly to the inference server.
-- `use_imatrix`: Enables importance matrix calibration during `llama.cpp` quantization.
-- `output_type`: Destination for artifacts (`none`, `local_ssd`, `direct_download`, `google_drive`, `gdrive_relative`, `gdrive_direct`, `huggingface_hub`, `custom_path`).
-- `output_path`: Destination path or Hugging Face repository ID (`username/repo-name`).
-- `output_name`: Custom filename or folder name. Derived automatically if left blank.
-- `zip_output`: Compresses exported artifacts into a `.zip` archive before saving or downloading.
-- `cleanup_source`: Deletes oversized source files after successful conversion to reclaim local disk space.
-- `enable_tunnel`: Launches a public tunnel endpoint.
-- `tunnel_type`: Public tunnel service (`cloudflared`, `ngrok`, `none`).
-- `tunnel_token`: Optional persistent Cloudflare Named Tunnel token or Ngrok authtoken.
-- `enable_api_auth`: Generates and enforces an API key for server access.
-- `port`: Local port for the inference server. Default: `8000`.
-- `hf_token`: Hugging Face access token for gated models and repository uploads.
+- `serve`: Inspect, resolve/download (auto-requantizing or auto-converting if needed), and start the OpenAI-compatible server.
+- `convert_and_quantize`: Convert or quantize weights with optional imatrix calibration and shard splitting, then register and export.
+- `convert_and_serve`: Convert Safetensors/LoRA to GGUF first, then immediately launch the GGUF server.
+- `benchmark`: Launch the model, measure TTFT and generation throughput (tok/s), and record metrics in the registry.
+- `inspect_only`: Dry-run metadata inspection and AutoSelector VRAM budget planning without downloading model weights.
+- `dashboard_only`: Launch the 8-tab Gradio management dashboard directly.
+- `serve_and_dashboard`: Start the model inference server in the background and launch the management dashboard.
 
 ---
 

@@ -1,14 +1,17 @@
 """
 Workspace Configuration & Path Management
+Provides structured settings, rich server presets supporting both Auto and Manual tuning,
+and unified CLI/config serialization helpers.
 """
 
+import json
 import os
-import shutil
+import shlex
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .io_resolver import (
     IOResolver,
@@ -24,17 +27,112 @@ FALLBACK_LOCAL_ROOT = str(get_default_local_root())
 DEFAULT_RUNTIME_ROOT = str(get_default_runtime_root())
 
 
+def parse_cli_args(raw: Union[str, List[str], Dict[str, Any], None]) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Normalizes arbitrary custom server arguments from string, list, or dict
+    into (dict_args, cli_token_list).
+    """
+    dict_args: Dict[str, Any] = {}
+    cli_tokens: List[str] = []
+
+    if not raw:
+        return dict_args, cli_tokens
+
+    if isinstance(raw, dict):
+        return dict(raw), []
+
+    if isinstance(raw, list):
+        return {}, [str(x) for x in raw if str(x).strip()]
+
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped:
+            return dict_args, cli_tokens
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, dict):
+                    return parsed, []
+            except Exception:
+                pass
+        try:
+            tokens = shlex.split(stripped)
+        except ValueError:
+            tokens = stripped.split()
+        return {}, tokens
+
+    return dict_args, cli_tokens
+
+
 class ServerPreset(BaseModel):
     name: str
     backend: str = "llama.cpp"
-    ctx_size: int = 4096
+    ctx_size: int = 4096  # 0 means auto
     n_gpu_layers: int = -1
-    flash_attn: bool = True
+    gpu_offload_mode: str = "auto"  # auto, all, cpu, manual
+    flash_attn: Optional[bool] = True  # None means auto
     cache_type_k: str = "q8_0"
     cache_type_v: str = "q8_0"
     parallel: int = 1
+    batch_size: int = 512
+    ubatch_size: int = 512
+    threads: int = 0  # 0 means auto
+    threads_batch: int = 0  # 0 means auto
+    split_mode: str = "layer"  # layer, row, none
+    tensor_split: Optional[str] = None
+    main_gpu: int = 0
+    override_tensor: Optional[str] = None
+    mlock: bool = False
+    mmap: bool = True
+    cont_batching: bool = True
+    jinja: bool = True
+    chat_template: Optional[str] = None
+    reasoning_format: Optional[str] = None
+    rope_scaling: Optional[str] = None
+    rope_freq_base: Optional[float] = None
+    rope_freq_scale: Optional[float] = None
+    seed: Optional[int] = None
+    enable_webui: bool = True
+    embedding: Optional[bool] = None
+    reranking: bool = False
+    draft_model_path: Optional[str] = None
+    mmproj_path: Optional[str] = None
+    lora_paths: List[str] = Field(default_factory=list)
+    quantization_mode: str = "auto"  # auto, bnb_4bit, bnb_8bit, fp16, bf16, fp32, fp8, awq, gptq
+    dtype: str = "auto"
+    gpu_memory_utilization: float = 0.90
+    enforce_eager: bool = False
+    tensor_parallel_size: int = 1
+    kv_cache_dtype: str = "auto"
+    diffusion_steps: int = 25
+    diffusion_guidance_scale: float = 7.5
+    diffusion_attention_slicing: bool = True
+    diffusion_cpu_offload: bool = False
+    whisper_compute_type: str = "auto"
+    whisper_beam_size: int = 5
+    whisper_vad_filter: bool = True
     custom_args: Dict[str, Any] = Field(default_factory=dict)
+    extra_cli_args: List[str] = Field(default_factory=list)
     description: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_custom_args(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        raw_custom = data.get("custom_args")
+        if isinstance(raw_custom, (str, list)):
+            dict_args, cli_tokens = parse_cli_args(raw_custom)
+            data = dict(data)
+            data["custom_args"] = dict_args
+            existing_extra = list(data.get("extra_cli_args") or [])
+            data["extra_cli_args"] = existing_extra + cli_tokens
+        raw_extra = data.get("extra_cli_args")
+        if isinstance(raw_extra, str):
+            _, cli_tokens = parse_cli_args(raw_extra)
+            data = dict(data)
+            data["extra_cli_args"] = cli_tokens
+        return data
 
 
 class WorkspaceSettings(BaseModel):
@@ -44,18 +142,43 @@ class WorkspaceSettings(BaseModel):
     runtime_root: str = DEFAULT_RUNTIME_ROOT
     default_backend: str = "llama.cpp"
     port: int = 8000
+    dashboard_port: int = 7860
     host: str = "0.0.0.0"
     tunnel_type: str = "cloudflared"  # cloudflared, ngrok, none
+    tunnel_hostname: str = ""
     enforce_auth: bool = True
-    auto_sync_to_drive: bool = True
+    auto_sync_to_drive: bool = False
     ssd_low_space_warning_gb: float = 10.0
     drive_low_space_warning_gb: float = 5.0
+    auto_cleanup_temp_on_low_space: bool = True
     active_profile: str = "core"
+    env_isolation_mode: str = "auto"  # auto, isolated_venv, system
+    venv_system_site_packages: bool = True
+    auto_install_dependencies: bool = True
+    llama_cpp_release_tag: str = "latest"
+    cuda_target: str = "auto"  # auto, cuda-12, cuda-13, cpu
+    download_backend: str = "auto"  # auto, aria2c, hf_transfer, urllib
+    aria2_connections: int = 16
+    selection_strategy: str = "balanced"  # balanced, max_quality, max_speed, max_context, low_vram_safe
+    cuda_overhead_mb: float = 1200.0
+    vram_safety_margin_pct: float = 0.05
+    auto_requantize: bool = True
+    auto_partial_offload: bool = True
+    prefer_ik_llama_for_moe: bool = True
+    default_quantizer: str = "auto"
+    default_target_quant: str = "auto"
+    default_outtype: str = "f16"
+    use_imatrix: bool = False
+    imatrix_chunks: int = 100
+    split_max_size: str = ""
+    cleanup_intermediate_files: bool = True
+    healthcheck_timeout_sec: int = 120
+    cors_allow_origins: str = "*"
     extra_settings: Dict[str, Any] = Field(default_factory=dict)
 
 
 class WorkspaceConfig:
-    """Manages workspace paths, directory initialization, and settings persistence."""
+    """Manages workspace paths, directory initialization, settings persistence, and presets."""
 
     def __init__(
         self,
@@ -175,13 +298,13 @@ class WorkspaceConfig:
                 default_settings = WorkspaceSettings(
                     workspace_mode=self.mode.value if hasattr(self.mode, "value") else str(self.mode),
                     drive_root=str(self.drive_root),
-                    runtime_root=str(self.runtime_root)
+                    runtime_root=str(self.runtime_root),
                 )
         else:
             default_settings = WorkspaceSettings(
                 workspace_mode=self.mode.value if hasattr(self.mode, "value") else str(self.mode),
                 drive_root=str(self.drive_root),
-                runtime_root=str(self.runtime_root)
+                runtime_root=str(self.runtime_root),
             )
         self.save_settings(default_settings)
         return default_settings
@@ -193,12 +316,130 @@ class WorkspaceConfig:
         try:
             self.settings_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.settings_file, "w", encoding="utf-8") as f:
-                yaml.dump(self.settings.model_dump(), f, default_flow_style=False)
+                yaml.dump(self.settings.model_dump(), f, default_flow_style=False, sort_keys=True)
         except (PermissionError, OSError):
             pass
 
+    def update_settings(self, **kwargs: Any) -> WorkspaceSettings:
+        """Updates one or more settings fields and persists settings.yaml."""
+        data = self.settings.model_dump()
+        extra = dict(data.get("extra_settings") or {})
+        valid_fields = set(WorkspaceSettings.model_fields.keys())
+        for key, val in kwargs.items():
+            if key in valid_fields:
+                data[key] = val
+            else:
+                extra[key] = val
+        data["extra_settings"] = extra
+        updated = WorkspaceSettings(**data)
+        self.save_settings(updated)
+        return updated
+
+    def _builtin_default_presets(self) -> Dict[str, ServerPreset]:
+        return {
+            "gguf_balanced": ServerPreset(
+                name="GGUF Balanced (4K FlashAttn)",
+                backend="llama.cpp",
+                ctx_size=4096,
+                n_gpu_layers=-1,
+                gpu_offload_mode="auto",
+                flash_attn=True,
+                cache_type_k="q8_0",
+                cache_type_v="q8_0",
+                parallel=1,
+                description="Fast and memory-efficient for 7B-14B models on T4/L4 GPUs.",
+            ),
+            "gguf_long_ctx": ServerPreset(
+                name="GGUF Long Context (16K FlashAttn + Q4 Cache)",
+                backend="llama.cpp",
+                ctx_size=16384,
+                n_gpu_layers=-1,
+                gpu_offload_mode="auto",
+                flash_attn=True,
+                cache_type_k="q4_0",
+                cache_type_v="q4_0",
+                parallel=1,
+                description="High context window with quantized KV cache for long document processing.",
+            ),
+            "vlm_multimodal": ServerPreset(
+                name="VLM Multimodal (Vision-Language)",
+                backend="llama.cpp",
+                ctx_size=4096,
+                n_gpu_layers=-1,
+                gpu_offload_mode="auto",
+                flash_attn=True,
+                cache_type_k="q8_0",
+                cache_type_v="q8_0",
+                parallel=1,
+                description="Multimodal LLM with mmproj projector enabled.",
+            ),
+            "vllm_high_throughput": ServerPreset(
+                name="vLLM High Throughput (L4/A100)",
+                backend="vllm",
+                ctx_size=4096,
+                dtype="auto",
+                gpu_memory_utilization=0.90,
+                custom_args={"gpu_memory_utilization": 0.90, "dtype": "auto"},
+                description="PagedAttention server for unquantized / AWQ / GPTQ Safetensors.",
+            ),
+            "transformers_4bit": ServerPreset(
+                name="Transformers + BitsAndBytes 4-Bit",
+                backend="transformers",
+                ctx_size=4096,
+                quantization_mode="bnb_4bit",
+                dtype="auto",
+                custom_args={"load_in_4bit": True, "device_map": "auto"},
+                description="Flexible fallback for Safetensors models on T4 GPUs.",
+            ),
+            "ik_llama_moe": ServerPreset(
+                name="ik_llama.cpp MoE & IQ Hybrid",
+                backend="ik_llama",
+                ctx_size=4096,
+                n_gpu_layers=-1,
+                gpu_offload_mode="auto",
+                flash_attn=True,
+                cache_type_k="q8_0",
+                cache_type_v="q8_0",
+                description="Optimized engine for non-uniform IQ quants and MoE hybrid CPU/GPU offload.",
+            ),
+            "unsloth_fast": ServerPreset(
+                name="Unsloth 4-Bit Fast Inference",
+                backend="unsloth",
+                ctx_size=4096,
+                quantization_mode="bnb_4bit",
+                custom_args={"load_in_4bit": True},
+                description="Unsloth FastLanguageModel engine for LoRA and 4-bit Safetensors.",
+            ),
+            "exllamav2_fast": ServerPreset(
+                name="ExLlamaV2 EXL2 Fast Inference",
+                backend="exllamav2",
+                ctx_size=4096,
+                cache_type_k="q8_0",
+                cache_type_v="q8_0",
+                description="Fractional bpw EXL2 execution engine for NVIDIA GPUs.",
+            ),
+            "diffusers_sd": ServerPreset(
+                name="Diffusers Image Generation",
+                backend="diffusers",
+                ctx_size=512,
+                diffusion_steps=25,
+                diffusion_guidance_scale=7.5,
+                diffusion_attention_slicing=True,
+                description="Stable Diffusion / SDXL / Flux image generation API server.",
+            ),
+            "whisper_audio": ServerPreset(
+                name="Faster-Whisper Speech-to-Text",
+                backend="faster-whisper",
+                whisper_compute_type="auto",
+                whisper_beam_size=5,
+                whisper_vad_filter=True,
+                description="Faster-Whisper CTranslate2 speech-to-text transcription API server.",
+            ),
+        }
+
     def load_presets(self) -> Dict[str, ServerPreset]:
-        """Load server presets from presets.yaml or create defaults."""
+        """Load server presets from presets.yaml or create defaults (merging any new built-ins)."""
+        defaults = self._builtin_default_presets()
         if self.presets_file.exists():
             try:
                 with open(self.presets_file, "r", encoding="utf-8") as f:
@@ -206,6 +447,14 @@ class WorkspaceConfig:
                 presets = {}
                 for key, val in raw_data.items():
                     presets[key] = ServerPreset(**val)
+                # Merge any missing new built-in presets without clobbering user presets
+                merged = False
+                for k, v in defaults.items():
+                    if k not in presets:
+                        presets[k] = v
+                        merged = True
+                if merged:
+                    self.save_presets(presets)
                 return presets
             except Exception as e:
                 print(f"[WorkspaceConfig] Warning: Failed to parse presets.yaml ({e}), creating defaults.")
@@ -219,77 +468,13 @@ class WorkspaceConfig:
                 presets = {}
                 for key, val in raw_data.items():
                     presets[key] = ServerPreset(**val)
+                for k, v in defaults.items():
+                    presets.setdefault(k, v)
                 self.save_presets(presets)
                 return presets
             except Exception:
                 pass
 
-        defaults = {
-            "gguf_balanced": ServerPreset(
-                name="GGUF Balanced (4K FlashAttn)",
-                backend="llama.cpp",
-                ctx_size=4096,
-                n_gpu_layers=-1,
-                flash_attn=True,
-                cache_type_k="q8_0",
-                cache_type_v="q8_0",
-                parallel=1,
-                description="Fast and memory-efficient for 7B-14B models on T4/L4 GPUs."
-            ),
-            "gguf_long_ctx": ServerPreset(
-                name="GGUF Long Context (16K FlashAttn + Q4 Cache)",
-                backend="llama.cpp",
-                ctx_size=16384,
-                n_gpu_layers=-1,
-                flash_attn=True,
-                cache_type_k="q4_0",
-                cache_type_v="q4_0",
-                parallel=1,
-                description="High context window with quantized KV cache for long document processing."
-            ),
-            "vlm_multimodal": ServerPreset(
-                name="VLM Multimodal (Vision-Language)",
-                backend="llama.cpp",
-                ctx_size=4096,
-                n_gpu_layers=-1,
-                flash_attn=True,
-                cache_type_k="q8_0",
-                cache_type_v="q8_0",
-                parallel=1,
-                description="Multimodal LLM with mmproj projector enabled."
-            ),
-            "vllm_high_throughput": ServerPreset(
-                name="vLLM High Throughput (L4/A100)",
-                backend="vllm",
-                ctx_size=4096,
-                custom_args={"gpu_memory_utilization": 0.90, "dtype": "auto"},
-                description="PagedAttention server for unquantized / AWQ / GPTQ Safetensors."
-            ),
-            "transformers_4bit": ServerPreset(
-                name="Transformers + BitsAndBytes 4-Bit",
-                backend="transformers",
-                ctx_size=4096,
-                custom_args={"load_in_4bit": True, "device_map": "auto"},
-                description="Flexible fallback for Safetensors models on T4 GPUs."
-            ),
-            "ik_llama_moe": ServerPreset(
-                name="ik_llama.cpp MoE & IQ Hybrid",
-                backend="ik_llama",
-                ctx_size=4096,
-                n_gpu_layers=-1,
-                flash_attn=True,
-                cache_type_k="q8_0",
-                cache_type_v="q8_0",
-                description="Optimized engine for non-uniform IQ quants and MoE hybrid CPU/GPU offload."
-            ),
-            "unsloth_fast": ServerPreset(
-                name="Unsloth 4-Bit Fast Inference",
-                backend="unsloth",
-                ctx_size=4096,
-                custom_args={"load_in_4bit": True},
-                description="Unsloth FastLanguageModel engine for LoRA and 4-bit Safetensors."
-            )
-        }
         self.save_presets(defaults)
         return defaults
 
@@ -303,6 +488,38 @@ class WorkspaceConfig:
                 yaml.dump(serializable, f, default_flow_style=False)
         except (PermissionError, OSError):
             pass
+
+    def upsert_preset(self, key: str, preset: ServerPreset) -> Dict[str, ServerPreset]:
+        """Creates or updates a named preset and persists presets.yaml."""
+        clean_key = key.strip().replace(" ", "_")
+        if not clean_key:
+            raise ValueError("Preset key cannot be empty.")
+        self.presets[clean_key] = preset
+        self.save_presets(self.presets)
+        return self.presets
+
+    def delete_preset(self, key: str) -> bool:
+        """Deletes a custom preset from presets.yaml."""
+        if key not in self.presets:
+            return False
+        del self.presets[key]
+        self.save_presets(self.presets)
+        return True
+
+    def export_config_bundle(self) -> Dict[str, Any]:
+        """Exports current settings and presets as a portable dictionary."""
+        return {
+            "settings": self.settings.model_dump(),
+            "presets": {k: v.model_dump() for k, v in self.presets.items()},
+        }
+
+    def import_config_bundle(self, data: Dict[str, Any]) -> None:
+        """Imports settings and presets from a dictionary."""
+        if "settings" in data and isinstance(data["settings"], dict):
+            self.save_settings(WorkspaceSettings(**data["settings"]))
+        if "presets" in data and isinstance(data["presets"], dict):
+            imported = {k: ServerPreset(**v) for k, v in data["presets"].items()}
+            self.save_presets(imported)
 
 
 _CONFIG_INSTANCE: Optional[WorkspaceConfig] = None

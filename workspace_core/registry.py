@@ -1,12 +1,11 @@
 """
 Model Registry & Storage Manager
-Tracks all imported models, active model status, Drive synchronization,
-benchmark metrics, and disk space maintenance.
+Tracks all imported/converted models, active model status, Drive synchronization,
+auto-discovery scanning on Drive/SSD, benchmark metrics, and disk space maintenance.
 """
 
 import datetime
 import json
-import os
 import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -32,6 +31,13 @@ class ModelEntry:
     created_at: str = field(default_factory=lambda: datetime.datetime.now().isoformat())
     last_used_at: Optional[str] = None
     benchmark_metrics: Dict[str, Any] = field(default_factory=dict)
+    backend_hint: Optional[str] = None
+    repo_id: Optional[str] = None
+    hf_revision: Optional[str] = None
+    preset_name: Optional[str] = None
+    extra_params: Dict[str, Any] = field(default_factory=dict)
+    notes: str = ""
+    tags: List[str] = field(default_factory=list)
 
     @property
     def total_size_gb(self) -> float:
@@ -39,7 +45,7 @@ class ModelEntry:
 
 
 class ModelRegistry:
-    """Manages the model registry file and storage cleanup/sync."""
+    """Manages the model registry file, workspace model scanning, and storage cleanup/sync."""
 
     def __init__(self, config: Optional[WorkspaceConfig] = None):
         self.config = config or get_config()
@@ -48,14 +54,16 @@ class ModelRegistry:
         self.load()
 
     def load(self) -> None:
-        """Loads registry from registry.json."""
+        """Loads registry from registry.json safely."""
         if self.registry_file.exists():
             try:
                 with open(self.registry_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self.entries = {}
+                valid_fields = {f_name for f_name in ModelEntry.__dataclass_fields__}
                 for mid, entry_dict in data.items():
-                    self.entries[mid] = ModelEntry(**entry_dict)
+                    filtered = {k: v for k, v in entry_dict.items() if k in valid_fields}
+                    self.entries[mid] = ModelEntry(**filtered)
             except Exception as e:
                 print(f"[ModelRegistry] Warning: Failed to load registry ({e}). Starting empty.")
                 self.entries = {}
@@ -66,6 +74,7 @@ class ModelRegistry:
     def save(self) -> None:
         """Saves registry to registry.json."""
         serializable = {mid: asdict(entry) for mid, entry in self.entries.items()}
+        self.registry_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.registry_file, "w", encoding="utf-8") as f:
             json.dump(serializable, f, indent=2)
 
@@ -82,7 +91,14 @@ class ModelRegistry:
         is_synced_to_drive: bool = False,
         mmproj_path: Optional[str] = None,
         shard_files: Optional[List[str]] = None,
-        set_active: bool = True
+        set_active: bool = True,
+        backend_hint: Optional[str] = None,
+        repo_id: Optional[str] = None,
+        hf_revision: Optional[str] = None,
+        preset_name: Optional[str] = None,
+        extra_params: Optional[Dict[str, Any]] = None,
+        notes: str = "",
+        tags: Optional[List[str]] = None,
     ) -> ModelEntry:
         """Registers a model into registry and optionally sets it as active."""
         if set_active:
@@ -103,6 +119,13 @@ class ModelRegistry:
             shard_files=[str(s) for s in (shard_files or [])],
             is_active=set_active,
             last_used_at=datetime.datetime.now().isoformat() if set_active else None,
+            backend_hint=backend_hint,
+            repo_id=repo_id,
+            hf_revision=hf_revision,
+            preset_name=preset_name,
+            extra_params=dict(extra_params or {}),
+            notes=notes,
+            tags=list(tags or []),
         )
         self.entries[model_id] = entry
         self.save()
@@ -142,12 +165,102 @@ class ModelRegistry:
             entry.benchmark_metrics = {
                 **entry.benchmark_metrics,
                 **metrics,
-                "tested_at": datetime.datetime.now().isoformat()
+                "tested_at": datetime.datetime.now().isoformat(),
             }
             self.save()
 
+    def scan_workspace_models(self) -> List[ModelEntry]:
+        """
+        Scans local SSD cache, runtime outputs, and persistent models directories
+        for unregistered models and imports them into registry.
+        """
+        from .model_inspector import ModelInspector
+
+        inspector = ModelInspector()
+        registered_paths = {Path(e.local_path).resolve() for e in self.entries.values() if e.local_path}
+        for e in self.entries.values():
+            if e.drive_path:
+                registered_paths.add(Path(e.drive_path).resolve())
+
+        scan_roots = [
+            self.config.runtime_models_cache_dir,
+            self.config.runtime_outputs_dir,
+            self.config.models_gguf_dir,
+            self.config.models_safetensors_dir,
+            self.config.models_diffusion_dir,
+            self.config.models_audio_dir,
+        ]
+
+        newly_added: List[ModelEntry] = []
+        seen_dirs = set()
+
+        for root in scan_roots:
+            if not root.exists():
+                continue
+            # Scan subdirectories (HF/CT2/Diffusers repos)
+            for sub in sorted(root.iterdir()):
+                if sub.resolve() in registered_paths or sub.resolve() in seen_dirs:
+                    continue
+                if sub.is_file() and sub.suffix.lower() in (".gguf", ".safetensors", ".ckpt"):
+                    if "mmproj" in sub.name.lower() or ".imatrix" in sub.name.lower():
+                        continue
+                    # Skip secondary shards of split GGUF
+                    if "-of-" in sub.name and "-00001-of-" not in sub.name:
+                        continue
+                    insp = inspector.inspect(str(sub), input_mode="local_path")
+                    if insp.error:
+                        continue
+                    mid = insp.model_id
+                    if mid in self.entries:
+                        continue
+                    variant = insp.gguf_variants[0] if insp.gguf_variants else None
+                    entry = self.register_model(
+                        model_id=mid,
+                        name=mid,
+                        type=insp.model_type,
+                        source_url=str(sub),
+                        quantization=variant.quant if variant else insp.quant_format,
+                        total_size_bytes=insp.total_repo_size_bytes,
+                        local_path=str(sub),
+                        mmproj_path=variant.mmproj_file if variant else None,
+                        shard_files=variant.shard_files if variant else [],
+                        backend_hint=insp.suggested_backend,
+                        set_active=False,
+                    )
+                    newly_added.append(entry)
+                    registered_paths.add(sub.resolve())
+                elif sub.is_dir():
+                    has_weights = any(
+                        any(sub.glob(p))
+                        for p in ("*.safetensors", "*.bin", "model_index.json", "*.gguf")
+                    )
+                    if not has_weights:
+                        continue
+                    seen_dirs.add(sub.resolve())
+                    insp = inspector.inspect(str(sub), input_mode="local_path")
+                    if insp.error:
+                        continue
+                    mid = insp.model_id
+                    if mid in self.entries:
+                        continue
+                    entry = self.register_model(
+                        model_id=mid,
+                        name=mid,
+                        type=insp.model_type,
+                        source_url=str(sub),
+                        quantization=insp.quant_format,
+                        total_size_bytes=insp.total_repo_size_bytes,
+                        local_path=str(sub),
+                        backend_hint=insp.suggested_backend,
+                        set_active=False,
+                    )
+                    newly_added.append(entry)
+                    registered_paths.add(sub.resolve())
+
+        return newly_added
+
     def sync_to_drive(self, model_id: str) -> bool:
-        """Copies local model files (including all shards and mmproj) to Google Drive persistent storage."""
+        """Copies local model files (including all shards and mmproj) to persistent storage."""
         entry = self.entries.get(model_id)
         if not entry:
             return False
@@ -156,7 +269,6 @@ class ModelRegistry:
         if not local_p.exists():
             return False
 
-        # Determine target category folder on Drive
         cat_map = {
             "llm-gguf": self.config.models_gguf_dir,
             "vlm-gguf": self.config.models_gguf_dir,
@@ -166,27 +278,29 @@ class ModelRegistry:
             "audio": self.config.models_audio_dir,
         }
         dest_dir = cat_map.get(entry.type, self.config.models_gguf_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
         dest_path = dest_dir / local_p.name
 
         print(f"[ModelRegistry] Syncing {local_p} -> {dest_path}...")
-        if local_p.is_file():
+        if local_p.is_file() and local_p.resolve() != dest_path.resolve():
             shutil.copy2(str(local_p), str(dest_path))
-        elif local_p.is_dir():
+        elif local_p.is_dir() and local_p.resolve() != dest_path.resolve():
             shutil.copytree(str(local_p), str(dest_path), dirs_exist_ok=True)
 
-        # Sync all additional shards if split GGUF
         if entry.shard_files:
             for s in entry.shard_files:
                 sp = Path(s)
-                if sp.exists() and sp.resolve() != local_p.resolve():
+                if sp.exists() and sp.is_file() and sp.resolve() != local_p.resolve():
                     s_dest = dest_dir / sp.name
-                    print(f"[ModelRegistry] Syncing shard {sp.name} -> {s_dest}...")
-                    shutil.copy2(str(sp), str(s_dest))
+                    if sp.resolve() != s_dest.resolve():
+                        print(f"[ModelRegistry] Syncing shard {sp.name} -> {s_dest}...")
+                        shutil.copy2(str(sp), str(s_dest))
 
-        # Sync mmproj if present
         if entry.mmproj_path and Path(entry.mmproj_path).exists():
             mm_p = Path(entry.mmproj_path)
-            shutil.copy2(str(mm_p), str(dest_dir / mm_p.name))
+            mm_dest = dest_dir / mm_p.name
+            if mm_p.resolve() != mm_dest.resolve():
+                shutil.copy2(str(mm_p), str(mm_dest))
 
         entry.drive_path = str(dest_path)
         entry.is_synced_to_drive = True
@@ -207,17 +321,15 @@ class ModelRegistry:
             elif local_p.is_dir():
                 shutil.rmtree(str(local_p))
 
-        # Delete all shards locally
         if entry.shard_files:
             for s in entry.shard_files:
                 sp = Path(s)
-                if sp.exists():
+                if sp.exists() and sp.is_file():
                     try:
                         sp.unlink()
                     except Exception:
                         pass
 
-        # Delete mmproj if it lives in local cache
         if entry.mmproj_path:
             mmp = Path(entry.mmproj_path)
             if mmp.exists() and str(mmp).startswith(str(self.config.runtime_root)):
@@ -244,22 +356,20 @@ class ModelRegistry:
             elif drive_p.is_dir():
                 shutil.rmtree(str(drive_p))
 
-        # Delete Drive copies of shards
         if entry.shard_files:
             for s in entry.shard_files:
                 s_name = Path(s).name
                 s_drive = drive_dir / s_name
-                if s_drive.exists():
+                if s_drive.exists() and s_drive.is_file():
                     try:
                         s_drive.unlink()
                     except Exception:
                         pass
 
-        # Delete Drive copy of mmproj
         if entry.mmproj_path:
             mm_name = Path(entry.mmproj_path).name
             mm_drive = drive_dir / mm_name
-            if mm_drive.exists():
+            if mm_drive.exists() and mm_drive.is_file():
                 try:
                     mm_drive.unlink()
                 except Exception:
@@ -287,8 +397,7 @@ class ModelRegistry:
     def purge_temp_files(self) -> int:
         """Purges leftover temporary files in runtime directory."""
         freed_bytes = 0
-        temp_patterns = ["*.tmp*", "*.aria2"]
-        for pattern in temp_patterns:
+        for pattern in ["*.tmp*", "*.aria2"]:
             for p in self.config.runtime_root.glob(f"**/{pattern}"):
                 try:
                     sz = p.stat().st_size

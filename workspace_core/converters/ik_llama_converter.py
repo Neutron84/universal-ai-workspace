@@ -1,7 +1,7 @@
 """
 ik_llama.cpp Converter & Quantizer Plugin
-Supports non-uniform quantization formats (IQ4_K, IQ4_KS, IQ3_K, IQ3_KS, IQ2_K, IQ2_KS, IQ5_K, IQ6_K)
-and MoE weight repacking for ikawrakow/ik_llama.cpp.
+Supports non-uniform quantization formats (IQ4_K, IQ4_KS, IQ3_K, IQ3_KS, IQ2_K, IQ2_KS, IQ5_K, IQ6_K),
+Safetensors-to-GGUF pre-conversion, optional imatrix calibration, and MoE weight repacking.
 """
 
 from pathlib import Path
@@ -10,13 +10,14 @@ import subprocess
 from typing import Any, Dict, List, Optional, Union
 
 from .base import BaseConverter
-from ..config import WorkspaceConfig, get_config
+from .llama_cpp_converter import LlamaCppConverter
+from ..config import WorkspaceConfig
 from ..env_manager import EnvironmentManager
 
 IK_SUPPORTED_QUANTS = {
     "IQ4_K", "IQ4_KS", "IQ3_K", "IQ3_KS", "IQ2_K", "IQ2_KS",
     "IQ5_K", "IQ6_K", "IQ4_XS", "IQ4_NL", "IQ3_M", "IQ3_S",
-    "IQ2_M", "IQ2_S", "IQ1_S", "IQ1_M", "Q4_K_M", "Q5_K_M", "Q8_0"
+    "IQ2_M", "IQ2_S", "IQ1_S", "IQ1_M", "Q4_K_M", "Q5_K_M", "Q8_0",
 }
 
 
@@ -46,7 +47,7 @@ class IKLlamaConverter(BaseConverter):
         return {
             "estimated_ram_gb": max(8.0, size_gb * 1.3),
             "estimated_vram_gb": 0.0,
-            "estimated_disk_gb": size_gb * 2.0,
+            "estimated_disk_gb": size_gb * 2.2,
         }
 
     def convert_or_quantize(
@@ -55,45 +56,83 @@ class IKLlamaConverter(BaseConverter):
         output_path: Optional[Union[str, Path]] = None,
         target_quant: Optional[str] = "IQ4_KS",
         cleanup_source: bool = False,
-        **kwargs
+        use_imatrix: bool = False,
+        calibration_text_path: Optional[Union[str, Path]] = None,
+        calibration_text: Optional[str] = None,
+        imatrix_chunks: Optional[int] = None,
+        outtype: Optional[str] = None,
+        threads: int = 0,
+        **kwargs: Any,
     ) -> Path:
-        """Executes non-uniform IQ quantization via ik_llama-quantize or standard llama-quantize."""
+        """
+        Converts Safetensors to base GGUF if needed, optionally computes imatrix,
+        and executes non-uniform IQ quantization via ik_llama-quantize.
+        """
         src = Path(input_path).resolve()
         if not src.exists():
             raise FileNotFoundError(f"Input path not found: {src}")
 
         target_q = (target_quant or "IQ4_KS").upper()
+        if target_q == "AUTO":
+            target_q = "IQ4_KS"
         outputs_dir = self.config.runtime_outputs_dir
         outputs_dir.mkdir(parents=True, exist_ok=True)
+        base_helper = LlamaCppConverter(self.config)
 
-        # Locate quantizer binary
+        # Ensure binaries are ready
         ik_quant_bin = self.bin_dir / "llama-quantize"
         if not ik_quant_bin.exists():
-            system_bin = shutil.which("llama-quantize") or "/usr/local/bin/llama-quantize"
-            quant_bin = system_bin if Path(system_bin).exists() else None
-        else:
-            quant_bin = str(ik_quant_bin)
-
-        if not quant_bin:
             self.install()
-            quant_bin = str(self.bin_dir / "llama-quantize") if (self.bin_dir / "llama-quantize").exists() else (shutil.which("llama-quantize") or "/usr/local/bin/llama-quantize")
+
+        if ik_quant_bin.exists():
+            quant_bin = str(ik_quant_bin)
+        else:
+            quant_bin = shutil.which("llama-quantize") or "/usr/local/bin/llama-quantize"
+
+        if not Path(quant_bin).exists():
+            raise FileNotFoundError(f"ik_llama llama-quantize binary not found at {quant_bin}")
+
+        intermediate_gguf: Optional[Path] = None
+        if src.is_dir() or src.suffix.lower() == ".safetensors":
+            base_outtype = outtype or self.config.settings.default_outtype or "f16"
+            print(f"[IKLlamaConverter] Converting Safetensors {src.name} to base GGUF ({base_outtype}) first...")
+            intermediate_gguf = outputs_dir / f"{src.stem}_{base_outtype}.gguf"
+            base_helper.convert_to_base_gguf(src, intermediate_gguf, outtype=base_outtype)
+            source_for_quant = intermediate_gguf
+        else:
+            source_for_quant = base_helper._maybe_merge_split_gguf(src, outputs_dir) or src
+
+        imatrix_file: Optional[Path] = None
+        if use_imatrix:
+            chunks = imatrix_chunks if imatrix_chunks is not None else self.config.settings.imatrix_chunks
+            imatrix_file = base_helper.compute_imatrix(
+                source_for_quant,
+                outputs_dir,
+                calibration_text_path=calibration_text_path,
+                calibration_text=calibration_text,
+                imatrix_chunks=chunks,
+            )
 
         if output_path:
             final_out = Path(output_path).resolve()
         else:
-            clean_stem = src.stem.replace("_f16", "").replace("_bf16", "")
+            clean_stem = source_for_quant.stem.replace("_f16", "").replace("_bf16", "").replace("_merged", "")
             final_out = outputs_dir / f"{clean_stem}_{target_q}.gguf"
 
         final_out.parent.mkdir(parents=True, exist_ok=True)
 
-        print(f"[IKLlamaConverter] Running non-uniform IQ quantization: {src.name} -> {target_q} ({final_out.name})...")
-        cmd = [
-            str(quant_bin),
+        print(f"[IKLlamaConverter] Running non-uniform IQ quantization: {source_for_quant.name} -> {target_q} ({final_out.name})...")
+        cmd: List[str] = [str(quant_bin)]
+        if imatrix_file and imatrix_file.exists():
+            cmd.extend(["--imatrix", str(imatrix_file)])
+        cmd.extend([
             "--allow-requantize",
-            str(src),
+            str(source_for_quant),
             str(final_out),
-            target_q
-        ]
+            target_q,
+        ])
+        if threads and int(threads) > 0:
+            cmd.append(str(int(threads)))
 
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if res.returncode != 0:
@@ -104,11 +143,9 @@ class IKLlamaConverter(BaseConverter):
 
         print(f"[IKLlamaConverter] Non-uniform quantization complete: {final_out} ({final_out.stat().st_size / (1024**3):.2f} GB)")
 
-        if cleanup_source and src != final_out:
-            print(f"[IKLlamaConverter] Cleaning up source file {src.name}...")
-            try:
-                src.unlink()
-            except Exception:
-                pass
+        if cleanup_source:
+            self.safe_cleanup(intermediate_gguf, keep_paths=[final_out])
+            self.safe_cleanup(imatrix_file, keep_paths=[final_out])
+            self.safe_cleanup(src, keep_paths=[final_out])
 
         return final_out

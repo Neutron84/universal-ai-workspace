@@ -1,11 +1,11 @@
 """
-Universal AI Workspace for Google Colab
+Universal AI Workspace for Google Colab & Linux Workstations
 Modular Python Core Package
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
-from .config import WorkspaceConfig, ServerPreset, WorkspaceSettings, get_config
+from .config import WorkspaceConfig, ServerPreset, WorkspaceSettings, get_config, parse_cli_args
 from .io_resolver import (
     IOResolver,
     OutputManager,
@@ -23,6 +23,7 @@ from .auto_selector import AutoSelector, SelectionRecommendation
 from .downloader import Downloader, DownloadResult
 from .registry import ModelRegistry, ModelEntry
 from .process_manager import ProcessManager, SystemState, TunnelInfo
+from .orchestrator import LaunchRequest, LaunchResult, WorkspaceOrchestrator
 from .engines import (
     BaseEngine,
     EngineStatus,
@@ -31,8 +32,11 @@ from .engines import (
     TransformersEngine,
     UnslothEngine,
     VLLMEngine,
+    ExLlamaV2Engine,
     DiffusersEngine,
     AudioEngine,
+    get_engine,
+    list_engines,
 )
 from .converters import (
     BaseConverter,
@@ -53,6 +57,7 @@ __all__ = [
     "ServerPreset",
     "WorkspaceSettings",
     "get_config",
+    "parse_cli_args",
     "IOResolver",
     "OutputManager",
     "WorkspaceMode",
@@ -79,6 +84,9 @@ __all__ = [
     "ProcessManager",
     "SystemState",
     "TunnelInfo",
+    "LaunchRequest",
+    "LaunchResult",
+    "WorkspaceOrchestrator",
     "BaseEngine",
     "EngineStatus",
     "LlamaCppEngine",
@@ -86,8 +94,11 @@ __all__ = [
     "TransformersEngine",
     "UnslothEngine",
     "VLLMEngine",
+    "ExLlamaV2Engine",
     "DiffusersEngine",
     "AudioEngine",
+    "get_engine",
+    "list_engines",
     "BaseConverter",
     "ConversionResult",
     "LlamaCppConverter",

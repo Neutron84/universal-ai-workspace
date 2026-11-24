@@ -1,36 +1,60 @@
 gguf_balanced:
   backend: llama.cpp
+  batch_size: 512
   cache_type_k: q8_0
   cache_type_v: q8_0
+  cont_batching: true
   ctx_size: 4096
   custom_args: {}
   description: Fast and memory-efficient for 7B-14B models on T4/L4 GPUs.
+  enable_webui: true
   flash_attn: true
+  gpu_offload_mode: auto
+  jinja: true
+  mmap: true
   n_gpu_layers: -1
   name: GGUF Balanced (4K FlashAttn)
   parallel: 1
+  split_mode: layer
+  ubatch_size: 512
 gguf_long_ctx:
   backend: llama.cpp
+  batch_size: 512
   cache_type_k: q4_0
   cache_type_v: q4_0
+  cont_batching: true
   ctx_size: 16384
   custom_args: {}
   description: High context window with quantized KV cache for long document processing.
+  enable_webui: true
   flash_attn: true
+  gpu_offload_mode: auto
+  jinja: true
+  mmap: true
   n_gpu_layers: -1
   name: GGUF Long Context (16K FlashAttn + Q4 Cache)
   parallel: 1
+  split_mode: layer
+  ubatch_size: 512
 ik_llama_moe:
   backend: ik_llama
+  batch_size: 512
   cache_type_k: q8_0
   cache_type_v: q8_0
+  cont_batching: true
   ctx_size: 4096
   custom_args: {}
   description: Optimized engine for non-uniform IQ quants and MoE hybrid CPU/GPU offload.
+  enable_webui: true
   flash_attn: true
+  gpu_offload_mode: auto
+  jinja: true
+  mmap: true
   n_gpu_layers: -1
   name: ik_llama.cpp MoE & IQ Hybrid
   parallel: 1
+  split_mode: layer
+  ubatch_size: 512
 unsloth_fast:
   backend: unsloth
   cache_type_k: q8_0
@@ -39,10 +63,12 @@ unsloth_fast:
   custom_args:
     load_in_4bit: true
   description: Unsloth FastLanguageModel engine for LoRA and 4-bit Safetensors.
+  dtype: auto
   flash_attn: true
   n_gpu_layers: -1
   name: Unsloth 4-Bit Fast Inference
   parallel: 1
+  quantization_mode: bnb_4bit
 transformers_4bit:
   backend: transformers
   cache_type_k: q8_0
@@ -52,10 +78,12 @@ transformers_4bit:
     device_map: auto
     load_in_4bit: true
   description: Flexible fallback for Safetensors models on T4 GPUs.
+  dtype: auto
   flash_attn: true
   n_gpu_layers: -1
   name: Transformers + BitsAndBytes 4-Bit
   parallel: 1
+  quantization_mode: bnb_4bit
 vllm_high_throughput:
   backend: vllm
   cache_type_k: q8_0
@@ -65,9 +93,22 @@ vllm_high_throughput:
     dtype: auto
     gpu_memory_utilization: 0.9
   description: PagedAttention server for unquantized / AWQ / GPTQ Safetensors.
+  dtype: auto
   flash_attn: true
+  gpu_memory_utilization: 0.9
   n_gpu_layers: -1
   name: vLLM High Throughput (L4/A100)
+  parallel: 1
+exllamav2_fast:
+  backend: exllamav2
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+  ctx_size: 4096
+  custom_args: {}
+  description: Fractional bpw EXL2 execution engine for NVIDIA GPUs.
+  flash_attn: true
+  n_gpu_layers: -1
+  name: ExLlamaV2 EXL2 Fast Inference
   parallel: 1
 vlm_multimodal:
   backend: llama.cpp
@@ -76,7 +117,29 @@ vlm_multimodal:
   ctx_size: 4096
   custom_args: {}
   description: Multimodal LLM with mmproj projector enabled.
+  enable_webui: true
   flash_attn: true
+  jinja: true
   n_gpu_layers: -1
   name: VLM Multimodal (Vision-Language)
   parallel: 1
+diffusers_sd:
+  backend: diffusers
+  ctx_size: 512
+  custom_args: {}
+  description: Stable Diffusion / SDXL / Flux image generation API server.
+  diffusion_attention_slicing: true
+  diffusion_cpu_offload: false
+  diffusion_guidance_scale: 7.5
+  diffusion_steps: 25
+  dtype: auto
+  name: Diffusers Image Generation
+whisper_audio:
+  backend: faster-whisper
+  ctx_size: 4096
+  custom_args: {}
+  description: Faster-Whisper CTranslate2 speech-to-text transcription API server.
+  name: Faster-Whisper Speech-to-Text
+  whisper_beam_size: 5
+  whisper_compute_type: auto
+  whisper_vad_filter: true
